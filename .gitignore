@@ -1,0 +1,35 @@
+# Environment configuration
+# 所有 .env / .env.* 一律忽略（.env.local、.env.production、.env.development、
+# .env.staging ...），只放行模板文件 .env.example。
+# 注意：否定规则必须写在忽略规则之后。
+.env
+.env.*
+!.env.example
+
+# 本地缓存（npm cache 等）
+.cache/
+
+# 前端
+node_modules/
+dist/
+dist-ssr/
+.vite/
+
+# Rust / Tauri
+src-tauri/target/
+# 整个 gen/ 都是 tauri-build 生成的（schemas 等），不提交
+src-tauri/gen/
+# 能力清单是 build.rs 依据 .env.local（或 CI 注入的 VITE_API_BASE_URL）生成的构建产物，
+# 里面含真实后端地址，不提交；模板见 src-tauri/capabilities/default.json.example
+src-tauri/capabilities/default.json
+
+# TypeScript 增量构建信息
+*.tsbuildinfo
+
+# 编辑器 / 系统
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.log

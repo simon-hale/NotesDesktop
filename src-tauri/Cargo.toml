@@ -1,0 +1,39 @@
+[package]
+name = "notes-desktop"
+version = "1.0.0"
+description = "Notes Desktop - 个人云网盘 Notes 的轻量桌面助手"
+authors = ["Notes"]
+edition = "2021"
+rust-version = "1.77.2"
+
+# 主程序入口在 src/main.rs，lib 供三平台复用的 run() 使用。
+# 本项目只做 Windows / macOS / Linux 桌面端，不需要 mobile 的 staticlib/cdylib。
+[lib]
+name = "notes_desktop_lib"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+serde_json = "1"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+# ⚠️ 固定到 2.6.x：Tauri CLI 要求 Rust crate 与 npm 包处于同一 major.minor。
+# 对应的 npm 包 @tauri-apps/plugin-http 目前最新是 2.6.1，而 crate 已经发到 2.7.0，
+# 用 "2" 会被解析成 2.7.0 并导致 `tauri build` 直接报版本不匹配而拒绝打包。
+tauri-plugin-http = "2.6"
+tauri-plugin-single-instance = "2"
+tauri-plugin-store = "2"
+serde = { version = "1", features = ["derive"] }
+
+# Windows 专属：当前用户级 Explorer 右键菜单（HKCU classic shell verb）。
+# 使用 target-specific 依赖，保证 macOS / Linux 仍然可以编译。
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

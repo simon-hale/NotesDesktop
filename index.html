@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      CSP 统一由 src-tauri/tauri.conf.json 的 app.security.csp 注入。
+      这里不要写第二份 CSP：两份 CSP 会取交集，反而会把 OSS 域误伤。
+    -->
+    <title>Notes Desktop</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
