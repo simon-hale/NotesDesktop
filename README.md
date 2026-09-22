@@ -4,7 +4,7 @@
 
 技术栈：**Tauri 2 + Vue 3 + TypeScript + Vite + ali-oss 6.23.x**。
 UI 使用 Vue + 原生 CSS，无 UI 框架、无 Electron、无 Node sidecar。
-本项目由 ChatGPT 5.6 Sol + Deepseek v4.1 Flash + Deepseek Harness 框架基于 Web 项目移植而来的轻量级桌面端跨平台上传工具，且暂时无功能补全计划。
+本项目是由 ChatGPT 5.6 Sol + Deepseek v4.1 Flash + Deepseek Harness 框架基于 Web 项目 [NotesFrontend (Vue3-Web)](https://github.com/simon-hale/NotesFrontend) 移植而来的轻量级桌面端跨平台上传工具，暂时无功能补全计划。
 
 ## 功能范围
 
@@ -255,17 +255,46 @@ notes:logout         某个窗口退出 / 令牌被判定失效 -> 其它窗口�
 
 #### 退出登录 / 换账号会清理账号相关的界面状态
 
-`auth.ts` 提供 `onSessionChanged()` 订阅。会话被清空、或登录账号发生变化时会派发一次，
-用于丢掉上一个账号遗留的状态，**避免新账号复用旧的目录 ID 或上传队列**：
+`auth.ts` 提供 `onSessionChanged()` 订阅，派发时带上 `{ previousUsername, currentUsername }`
+（**只有账号名，没有 JWT**）。会话被清空、登录、或登录账号发生变化时都会派发一次，
+用于丢掉上一个账号遗留的状态，**避免新账号复用旧的目录 ID、上传队列或恢复任务**：
 
-- `upload.ts`：**先请求取消并立即清空** `uploadState.tasks` 与目标目录（都在任何 `await`
-  之前完成，避免覆盖新会话已初始化的状态），**再**对上一会话的上传做有界等待；
-  被移出界面的任务对象仍被 worker 持有，会照常走完取消/清理。
+- `upload.ts`：**先请求取消**，并在任何 `await` 之前重算 `uploadState.tasks` 与清空目标目录，
+  **再**对上一会话的上传做有界等待；被移出界面的任务对象仍被 worker 持有，
+  会照常走完取消/清理。任务的取舍见下一节。
 - `UploadView`：目标为空**且没有上传在跑**时加载当前账号自己的 root
   （同时监听 `target.length` 与 `running`，因此上一会话的上传收尾后也能补上初始化）。
 - `HomeView`：清空面包屑/列表，并在仍处于登录态时重新 `loadRoot()`。
 
 订阅者出错不会影响其它订阅者，也不会阻塞认证流程（清理本身是异步的）。
+
+#### 恢复任务（metadata-pending）如何跨重新登录保留
+
+**可恢复任务的定义**：`objectUploaded === true && status !== 'success'`，
+也就是"OSS 对象**已经完整上传**，但 `/api/file/insert/` 还没成功"。
+每个任务在创建时都会打上 `ownerUsername`（**只记账号名，绝不记 JWT**）。
+
+会话变化时的取舍规则（其余任务一律清掉，与之前一致）：
+
+| 场景 | `previousUsername` → `currentUsername` | 保留谁 |
+| --- | --- | --- |
+| 退出登录 / 令牌失效 | `A` → `''` | `A` 的恢复任务（等它回来补写元数据） |
+| 同一账号重新登录 | `''` → `A` | `A` 的恢复任务继续可重试 |
+| 换账号登录（本地或远端） | `A` → `B` | 只留 `B` 的；**`A` 的全部丢弃** |
+
+即 `keepUsername = currentUsername || previousUsername`，只有
+`isMetadataPendingTask(task) && task.ownerUsername === keepUsername` 的任务会被保留。
+**一个账号的待办永远不会出现在另一个账号的界面里。**
+
+重试行为：
+
+- 只用**当时最新的**访问令牌（`getAccessToken()`），不会保存或复用旧令牌；
+- 只走补写元数据的分支（`/api/file/insert/`），**绝不重传 OSS 对象**；
+- 因此即使重新登录后换了目标目录也不影响它——补写用的是上传成功时保存的
+  `uploadedPath` / `uploadedParentId` / `uploadedFilename` 快照。
+
+其他约束：恢复任务**只存在于内存**，不落盘，应用重启即丢弃（本项目没有为上传队列
+设计持久化机制）；这类任务仍然只能 Retry，不能被 Remove / Clear。
 
 #### 认证请求的代际号（防止过期响应覆盖新登录）
 
@@ -529,6 +558,23 @@ HKCU\Software\Classes\*\shell\NotesUpload\command
     `removeTask` / `clearFinishedTasks` / `clearAllTasks` 都会保留它，
     界面上也不提供"移除"按钮——丢掉它等于制造一个用户看不见也删不掉的 OSS 孤儿对象。
 - 同目录同名：后端返回 `same_file_name` 时给出简短覆盖提示并继续上传（沿用后端覆盖语义）。
+- **登录态失效（后端 tokenVersion 机制）**在接口层表现为 HTTP **401 / 403**，
+  上传流程把它识别为“会话过期”而不是普通上传失败：
+
+  | 行为 | 说明 |
+  | --- | --- |
+  | 提示 | 显示 **“登录状态已失效，请重新登录”**；若 OSS 对象已传完，追加“登录后重试只会补写元数据” |
+  | 重试 | **不重试**。`isRetryableError` 明确把 401/403 排除在外，分片重试、空文件重传都不会覆盖它 |
+  | 当前请求 | 上传流程自身遇到 401/403 时**不主动清任务、不清目标目录、不触发 `logout()`** |
+  | 恢复状态 | 已经 OSS 完成的（99%）任务保持 99% 与 `uploadedPath` / `uploadedParentId` / `uploadedFilename` 快照；会话变化时仅保留属于相应账号的 metadata-pending 任务，重新登录后可继续补写元数据、不重传文件 |
+
+  这里不由上传流程直接触发 `logout()`：401/403 发生时 OSS 上可能已经存在完整对象，
+  直接清掉恢复任务会制造用户无法管理的孤儿对象。
+
+  如果登录态随后确实发生变化，则仍会走 `clearSession` → `onSessionChanged`：
+  普通或未完成的上传任务会被清理，目标目录会重置；只有“OSS 已完整上传、元数据尚未写入”
+  且属于对应账号的恢复任务会暂时保留。同一账号重新登录后可继续 Retry；
+  若切换到其他账号，则旧账号的恢复任务会被丢弃，避免跨账号状态泄漏。
 
 ## 7. OSS CORS（可能需要运维配置）
 

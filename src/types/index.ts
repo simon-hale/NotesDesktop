@@ -100,6 +100,13 @@ export interface UploadTask {
   path: string
   name: string
   size: number
+  /**
+   * 创建这个任务的账号名。
+   *
+   * 会话切换时靠它判断"哪些恢复任务还属于当前账号"。
+   * **只记账号名，绝不记 JWT**——重试时一律使用当时最新的访问令牌。
+   */
+  ownerUsername: string
   status: UploadStatus
   /** 0 ~ 1；OSS 阶段最多 OSS_PROGRESS_CAP，insert 成功后才到 1。 */
   progress: number

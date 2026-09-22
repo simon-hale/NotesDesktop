@@ -54,7 +54,14 @@ export class ApiError extends Error {
 export const isAbortedError = (error: unknown): boolean =>
   error instanceof ApiError && error.kind === 'aborted'
 
-/** 明确的认证失败：401 / 403 才算，普通断网/超时不算。 */
+/**
+ * 明确的认证失败：HTTP 401 / 403 才算，普通断网/超时不算。
+ *
+ * 后端的 tokenVersion 会话失效机制就表现为这两种状态码：
+ * 版本号被提升后，旧 JWT 一律被拒。客户端没有 refresh 机制，
+ * 因此这里只做"识别"，由调用方决定怎么处理（上传流程会保留恢复状态、
+ * 不重试，并提示用户重新登录）。
+ */
 export const isAuthFailure = (error: unknown): boolean =>
   error instanceof ApiError &&
   error.kind === 'http' &&

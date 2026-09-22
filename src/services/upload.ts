@@ -33,9 +33,11 @@ import {
   ApiError,
   buildStringOfPath,
   insertFileRecord,
+  isAuthFailure,
   requestUploadTicket
 } from './api'
-import { getAccessToken, onSessionChanged } from './auth'
+import { getAccessToken, getCurrentUsername, onSessionChanged } from './auth'
+import type { SessionChange } from './auth'
 import { readFileChunk, setUploadActive, setUploadBatchBusy, statLocalFile } from './filesystem'
 
 type OssClient = import('ali-oss').default
@@ -43,6 +45,17 @@ type MultipartPart = import('ali-oss').MultipartPart
 
 /** OSS multipart 最多 10000 个分片。 */
 const OSS_MAX_PART_NUMBER = 10000
+
+/**
+ * 登录态失效时给用户看的提示。
+ *
+ * 后端的 tokenVersion 机制（提升版本号即让旧 JWT 全部失效）在接口层表现为
+ * HTTP 401 / 403。上传流程必须把它识别成"会话过期"，而不是笼统的上传失败：
+ *   - **不重试**：认证失败重试多少次都一样；
+ *   - **不清理任何上传状态**：OSS 上可能已经存在完整对象或未完成分片，
+ *     清掉任务列表等于把它变成没人认领的孤儿对象。
+ */
+const SESSION_EXPIRED_MESSAGE = '登录状态已失效，请重新登录'
 
 /**
  * 上传被用户取消。
@@ -182,10 +195,15 @@ interface OssLikeError {
  * 可重试错误：
  *   网络错误 / timeout / connection|socket|ECONNRESET|RequestError /
  *   无 HTTP status / HTTP 408 / HTTP 429 / HTTP >= 500
- * 业务错误、403 等不重试。
+ *
+ * **认证失败（HTTP 401 / 403）永远不重试**：它们不在上面的集合里，所以
+ * 无论是后端接口返回的 `ApiError`，还是 OSS 因凭证失效返回的 403，
+ * 都会被判为不可重试（tokenVersion 失效、STS 过期都属于这一类）。
+ * 业务错误同样不重试。
  */
 const isRetryableError = (error: unknown): boolean => {
   if (error instanceof UploadCanceledError) return false
+  if (isAuthFailure(error)) return false
 
   if (error instanceof ApiError) {
     if (error.kind === 'network') return true
@@ -523,14 +541,24 @@ async function insertMetadataOnly(
       return
     }
 
-    // OSS 已经成功，只是元数据没写进去：不要偷偷重传整个文件。
     task.status = 'error'
     task.progress = OSS_PROGRESS_CAP
+
+    // 登录态失效（401/403，例如后端 tokenVersion 被提升）：
+    // 明确告知会话过期，同时**保留 99% 的恢复状态**——OSS 对象已经完整上传，
+    // 重新登录后点重试只会补写元数据，不会重传文件。
+    if (isAuthFailure(error)) {
+      task.message = `${SESSION_EXPIRED_MESSAGE}；OSS 已上传，登录后重试只会补写元数据`
+      return
+    }
+
+    // OSS 已经成功，只是元数据没写进去：不要偷偷重传整个文件。
     task.message = `OSS 已上传成功，但文件元数据写入失败：${describeError(error)}`
   }
 }
 
-async function runTask(task: UploadTask, signal: AbortSignal): Promise<void> {  task.status = 'uploading'
+async function runTask(task: UploadTask, signal: AbortSignal): Promise<void> {
+  task.status = 'uploading'
   task.message = ''
   task.overwrite = false
 
@@ -651,13 +679,25 @@ async function runTask(task: UploadTask, signal: AbortSignal): Promise<void> {  
       // OSS 已经成功，只是元数据没写进去：不要偷偷重传整个文件。
       task.status = 'error'
       task.progress = OSS_PROGRESS_CAP
-      task.message = `OSS 已上传成功，但文件元数据写入失败：${describeError(error)}`
+
+      // 登录态失效（401/403，例如后端 tokenVersion 被提升）：
+      // 保留 99% 恢复状态与 objectUploaded 快照，重新登录后重试只补写元数据。
+      task.message = isAuthFailure(error)
+        ? `${SESSION_EXPIRED_MESSAGE}；OSS 已上传，登录后重试只会补写元数据`
+        : `OSS 已上传成功，但文件元数据写入失败：${describeError(error)}`
+
       return
     }
 
     task.status = 'error'
     task.progress = 0
-    task.message = describeError(error)
+
+    // 登录态失效要给出明确原因，而不是笼统的上传失败。
+    // 注意：这里**不做任何清理**（不清任务、不清目标目录、不触发 logout）——
+    // OSS 上可能已经有传完的对象，清掉这些状态会让它变成没人认领的孤儿对象。
+    task.message = isAuthFailure(error)
+      ? SESSION_EXPIRED_MESSAGE
+      : describeError(error)
   }
 }
 
@@ -710,6 +750,9 @@ export async function addPaths(paths: string[]): Promise<AddPathsResult> {
         path: info.path,
         name: info.name,
         size: info.size,
+        // 记下创建者账号（只记账号名，不记令牌）：
+        // 会话切换时靠它判断这个恢复任务还能不能留。
+        ownerUsername: getCurrentUsername(),
         status: 'pending',
         progress: 0,
         message: '',
@@ -949,35 +992,55 @@ export function waitForUploadIdleBounded(timeoutMs: number): Promise<boolean> {
 }
 
 /**
- * 退出登录 / 切换账号时清理与账号绑定的上传状态。
+ * 会话变化（退出登录 / 换账号 / 登录）时清理与账号绑定的上传状态。
  *
  * 顺序很重要（必须是"先清界面状态、后等待收尾"）：
  *   ① 请求取消：abort signal + 立刻发一次 best-effort multipart abort；
- *   ② **立即**清空 tasks 与 target —— 两个动作都在任何 await 之前完成，
+ *   ② **立即**重算 tasks 与清空 target —— 都在任何 await 之前完成，
  *      否则新会话可能已经初始化了自己的状态，却被这次清理抹掉；
  *   ③ 再对上一会话的上传做有界等待。
  *
- * 第 ③ 步**不再**清空 tasks/target：那时新会话可能已经加载了自己的 root。
+ * 保留规则（**只保留恢复任务**）：
+ *   - 普通 / 未完成的任务一律清掉（与之前完全一致）；
+ *   - 只有"OSS 对象已经完整上传、只差写元数据"的任务才可能留下，
+ *     而且必须属于**当前（或刚刚离开的）账号**——绝不把一个账号的待办暴露给另一个账号。
+ *   - 任务上只记了账号名，没有令牌；重试时用的是那时最新的访问令牌，
+ *     并且只走补写元数据的分支，绝不会重传 OSS 对象。
+ *
+ * 第 ③ 步**不再**清 tasks/target：那时新会话可能已经加载了自己的 root。
  * 被移出界面的任务对象仍被 worker 持有（startUpload 捕获了任务引用），
  * 它们会照常走完取消 / abort / 清理流程，不影响收尾。
  */
-async function resetUploadStateForSessionChange(): Promise<void> {
+async function resetUploadStateForSessionChange(change: SessionChange): Promise<void> {
   // 先让代际号前进：所有在途的异步操作（addPaths 等）从此刻起一律失效。
   uploadSessionGeneration += 1
 
   // ① 请求取消（没有活动上传时是空操作）。
   cancelUpload()
 
-  // ② 立即作废与账号绑定的界面状态——必须在第一个 await 之前。
-  uploadState.tasks.splice(0, uploadState.tasks.length)
+  // ② 立即重算任务列表与目标目录——必须在第一个 await 之前。
+  const hadTasks = uploadState.tasks.length > 0
+
+  // 登出时 currentUsername 为空串：此时保留"刚离开的那个账号"的恢复任务，
+  // 等它重新登录后还能补写元数据；换账号时保留的是新账号自己的任务。
+  const keepUsername = change.currentUsername || change.previousUsername
+
+  const keptTasks = uploadState.tasks.filter(
+    (task) => isMetadataPendingTask(task) && task.ownerUsername === keepUsername
+  )
+
+  uploadState.tasks.splice(0, uploadState.tasks.length, ...keptTasks)
   uploadState.target = []
 
-  // 列表已清空 => 这一批不再占用全局目标目录，把状态同步给 Rust。
-  // （上传窗口自己的 watcher 也会做这件事，这里是会话切换时的权威兜底。）
-  try {
-    await setUploadBatchBusy(false)
-  } catch {
-    // 状态同步失败不影响清理本身。
+  // 任务列表变了 => 同步"这一批是否仍被占用"。
+  // 只有这个窗口真的持有过任务时才写：主窗口的任务列表永远是空的，
+  // 让它去写会把上传窗口的状态覆盖掉。
+  if (hadTasks) {
+    try {
+      await setUploadBatchBusy(keptTasks.some((task) => task.status !== 'success'))
+    } catch {
+      // 状态同步失败不影响清理本身。
+    }
   }
 
   // ③ 有界等待上一会话的上传收尾：不因为某个分片卡住就无限拖延
@@ -985,9 +1048,9 @@ async function resetUploadStateForSessionChange(): Promise<void> {
   await waitForUploadIdleBounded(UPLOAD_CLEANUP_TIMEOUT_MS)
 }
 
-// 账号被清空 / 更换账号时自动清理，避免状态跨账号泄漏。
-onSessionChanged(() => {
-  void resetUploadStateForSessionChange()
+// 账号被清空 / 更换账号 / 重新登录时自动清理或保留，避免状态跨账号泄漏。
+onSessionChanged((change) => {
+  void resetUploadStateForSessionChange(change)
 })
 
 /** 窗口卸载时调用：取消进行中的上传并释放引用。 */

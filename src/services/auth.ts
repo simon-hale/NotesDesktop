@@ -143,8 +143,21 @@ const resetInMemory = (): void => {
   authState.username = ''
 }
 
+/**
+ * 会话变化事件的载荷。
+ *
+ * 只带**用户名**（账号标识），绝不携带 JWT：上传任务只按账号名归属，
+ * 重试时一律使用"当时最新的"访问令牌。
+ */
+export interface SessionChange {
+  /** 变化之前登录的账号（原本就未登录时为空串）。 */
+  previousUsername: string
+  /** 变化之后的账号：登出为空串，登录/换账号为新账号名。 */
+  currentUsername: string
+}
+
 /** 会话被清空 / 账号发生变化时的订阅者。 */
-type SessionChangeListener = () => void
+type SessionChangeListener = (change: SessionChange) => void
 
 const sessionChangeListeners = new Set<SessionChangeListener>()
 
@@ -164,16 +177,19 @@ export const onSessionChanged = (listener: SessionChangeListener): (() => void) 
   }
 }
 
-const notifySessionChanged = (): void => {
+const notifySessionChanged = (change: SessionChange): void => {
   // 复制一份再遍历：订阅者在回调里取消订阅也不会影响本次派发。
   for (const listener of [...sessionChangeListeners]) {
     try {
-      listener()
+      listener(change)
     } catch {
       // 单个订阅者出错不影响其它订阅者。
     }
   }
 }
+
+/** 当前登录的用户名（未登录为空串）。只用于给上传任务打账号标记。 */
+export const getCurrentUsername = (): string => authState.username
 
 /** 另一个窗口的 label：登录态广播只发给它。 */
 const otherWindowLabel = (): string => {
@@ -208,6 +224,9 @@ const broadcast = async (event: string, payload?: unknown): Promise<void> => {
  * 并通知订阅者清理与账号绑定的状态（上传任务、目标目录、已浏览目录……）。
  */
 async function clearSession(broadcastChange: boolean): Promise<void> {
+  // 先记下"离开的是哪个账号"：订阅者需要它来判断哪些恢复任务还能留。
+  const previousUsername = authState.username
+
   invalidateAuthRequests()
 
   resetInMemory()
@@ -216,7 +235,7 @@ async function clearSession(broadcastChange: boolean): Promise<void> {
 
   // 先把"会话已清空"这一事实派发出去（订阅者的清理是异步的，不阻塞这里），
   // 再落盘删除持久化信息。
-  notifySessionChanged()
+  notifySessionChanged({ previousUsername, currentUsername: '' })
 
   try {
     await clearPersisted()
@@ -236,6 +255,9 @@ export async function logout(): Promise<void> {
 
 /** 用户名 + 密码登录。 */
 export async function login(username: string, password: string): Promise<void> {
+  // 登录前后的账号名：订阅者据此决定上一个账号遗留的恢复任务要不要丢掉。
+  const previousUsername = authState.username
+
   const { generation, controller } = beginAuthRequest()
   authState.message = ''
 
@@ -248,6 +270,11 @@ export async function login(username: string, password: string): Promise<void> {
     accessToken = token
     authState.username = username
     authState.status = 'authenticated'
+
+    // 账号变了（含"从未登录 -> 登录"）：通知订阅者按新账号清理/保留状态。
+    if (previousUsername !== username) {
+      notifySessionChanged({ previousUsername, currentUsername: username })
+    }
 
     let persisted = true
 
@@ -437,9 +464,12 @@ async function applyRemoteAuthChange(): Promise<void> {
   authState.status = 'authenticated'
   authState.message = ''
 
-  // 换成了另一个账号：清理上一个账号遗留的界面/上传状态。
-  if (previousUsername && previousUsername !== persisted.username) {
-    notifySessionChanged()
+  // 账号变了（含"本窗口原本未登录 -> 采纳其它窗口的登录"）：
+  // 通知订阅者按新账号清理/保留状态。
+  // 注意这里也要覆盖 previousUsername 为空串的情况——否则上一个账号遗留的
+  // 恢复任务会在新账号登录后继续留在列表里。
+  if (previousUsername !== persisted.username) {
+    notifySessionChanged({ previousUsername, currentUsername: persisted.username })
   }
 }
 
