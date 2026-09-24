@@ -413,6 +413,24 @@ const closePrompt = (): void => {
   prompt.token = ''
 }
 
+/**
+ * 变更失败后刷新当前目录，让 UI 与后端重新对齐。
+ *
+ * 之所以不直接调用 `refresh()`：`loadDirectory` / `loadRoot` 会在**同步阶段**
+ * 就把 `errorMessage` 清空，若等下一次渲染再恢复错误提示，中间会有一帧空白，
+ * 刷新失败时更会把用户刚看到的错误**永久**抹掉。
+ * 所以这里先记下错误文本，发起刷新后立刻写回，保证错误提示与刷新**同时**生效。
+ */
+const refreshAfterMutationFailure = (): void => {
+  const message = errorMessage.value
+
+  refresh()
+
+  if (message) {
+    errorMessage.value = message
+  }
+}
+
 const submitPrompt = async (): Promise<void> => {
   const value = prompt.value.trim()
 
@@ -482,6 +500,11 @@ const submitPrompt = async (): Promise<void> => {
     }
 
     prompt.error = error instanceof Error ? error.message : '操作失败'
+
+    // 后端可能已经改了一半（例如重命名与并发变更相撞）：刷新一次，
+    // 避免界面继续显示后端已经不存在的旧条目。失败提示在 prompt 里，
+    // 不受刷新影响；成功失败判定只依据是否抛错，不匹配具体错误文案。
+    refreshAfterMutationFailure()
   } finally {
     if (!disposed) {
       prompt.busy = false
@@ -548,6 +571,10 @@ const handleRemove = async (entry: EntryRef): Promise<void> => {
     }
 
     errorMessage.value = error instanceof Error ? error.message : '删除失败'
+
+    // 删除失败也可能意味着后端状态已变（条目其实已被删掉等）：
+    // 刷新当前目录，并在刷新时保留上面的错误提示。
+    refreshAfterMutationFailure()
   } finally {
     if (!disposed) {
       mutating.value = false
