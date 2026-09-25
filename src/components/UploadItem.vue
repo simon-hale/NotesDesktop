@@ -1,5 +1,14 @@
 <script setup lang="ts">
-/** 上传窗口中的单条任务：文件名 / 大小 / 进度 / 状态 / 失败原因 / 重试 / 移除。 */
+/**
+ * 上传窗口中的单条任务。
+ *
+ * 按钮语义（**暂停与取消必须一眼分清**）：
+ *   - 上传中       → 暂停             （保留 uploadId 与已完成分片，绝不 abort）
+ *   - 已暂停       → 继续 | 取消上传   （取消上传才是破坏性操作）
+ *   - 登记元数据中 → 重试             （只补写 /api/file/insert/，绝不重传对象）
+ *   - 已中断       → 继续 | 移除       （移除会对残留的 multipart 做破坏性清理）
+ *   - 其它         → 移除 / 重试
+ */
 import { computed } from 'vue'
 
 import type { UploadTask } from '../types'
@@ -11,23 +20,42 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  retry: [taskId: string]
+  resume: [taskId: string]
+  pause: [taskId: string]
+  cancel: [taskId: string]
   remove: [taskId: string]
 }>()
 
 const STATUS_LABELS: Record<UploadTask['status'], string> = {
   pending: '等待上传',
   uploading: '上传中',
+  pausing: '正在暂停…',
+  paused: '已暂停',
+  metadata_pending: '正在登记文件信息…',
   success: '已完成',
-  error: '失败',
+  error: '已中断（可继续）',
   canceled: '已取消'
 }
 
 const statusLabel = computed(() => STATUS_LABELS[props.task.status])
 
-const canRetry = computed(
-  () => props.task.status === 'error' || props.task.status === 'canceled'
+/** 只有真正在传的时候才谈得上暂停。 */
+const canPause = computed(() => props.task.status === 'uploading')
+
+/**
+ * 可以"继续"的状态：暂停 / 可恢复错误 / 已取消 / 元数据待补写。
+ * 元数据待补写时"继续"等价于只重试 /api/file/insert/。
+ */
+const canResume = computed(
+  () =>
+    props.task.status === 'paused' ||
+    props.task.status === 'error' ||
+    props.task.status === 'canceled' ||
+    props.task.status === 'metadata_pending'
 )
+
+/** 暂停 / 中断的任务里可能还留着远端 multipart，"取消上传"才是清掉它的路径。 */
+const canCancel = computed(() => props.task.status === 'paused')
 
 /**
  * "OSS 已成功但元数据待补写"的任务不允许移除：
@@ -37,9 +65,18 @@ const canRetry = computed(
 const canRemove = computed(
   () =>
     props.task.status !== 'uploading' &&
-    props.task.status !== 'pending' &&
+    props.task.status !== 'pausing' &&
     !isMetadataPendingTask(props.task)
 )
+
+const progressBarClass = computed(() => ({
+  'progress__bar--error': props.task.status === 'error',
+  'progress__bar--success': props.task.status === 'success',
+  'progress__bar--paused':
+    props.task.status === 'paused' ||
+    props.task.status === 'pausing' ||
+    props.task.status === 'pending'
+}))
 </script>
 
 <template>
@@ -57,10 +94,7 @@ const canRemove = computed(
     <div class="progress">
       <div
         class="progress__bar"
-        :class="{
-          'progress__bar--error': task.status === 'error',
-          'progress__bar--success': task.status === 'success'
-        }"
+        :class="progressBarClass"
         :style="{ width: `${Math.round(Math.min(1, Math.max(0, task.progress)) * 100)}%` }"
       />
     </div>
@@ -71,12 +105,28 @@ const canRemove = computed(
 
     <div class="item__actions">
       <button
-        v-if="canRetry"
+        v-if="canPause"
         class="btn btn--small"
         type="button"
-        @click="emit('retry', task.id)"
+        @click="emit('pause', task.id)"
       >
-        重试
+        暂停
+      </button>
+      <button
+        v-if="canResume"
+        class="btn btn--small"
+        type="button"
+        @click="emit('resume', task.id)"
+      >
+        {{ task.status === 'metadata_pending' ? '重试' : '继续' }}
+      </button>
+      <button
+        v-if="canCancel"
+        class="btn btn--danger btn--small"
+        type="button"
+        @click="emit('cancel', task.id)"
+      >
+        取消上传
       </button>
       <button
         v-if="canRemove"
@@ -109,6 +159,15 @@ const canRemove = computed(
   border-color: rgba(214, 69, 69, 0.35);
 }
 
+.item--paused,
+.item--pausing {
+  border-color: rgba(183, 121, 31, 0.35);
+}
+
+.item--metadata_pending {
+  border-color: var(--primary);
+}
+
 .item__head {
   display: flex;
   align-items: center;
@@ -138,6 +197,15 @@ const canRemove = computed(
   color: var(--danger);
 }
 
+.item--paused .item__status,
+.item--pausing .item__status {
+  color: var(--warning);
+}
+
+.item--metadata_pending .item__status {
+  color: var(--primary);
+}
+
 .item__meta {
   display: flex;
   justify-content: space-between;
@@ -165,6 +233,10 @@ const canRemove = computed(
 
 .progress__bar--error {
   background: var(--danger);
+}
+
+.progress__bar--paused {
+  background: var(--warning);
 }
 
 .item__message {

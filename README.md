@@ -225,7 +225,8 @@ macOS 产出 `.app` / `.dmg`，Linux 产出 `.deb` / `.rpm` / `.AppImage`（在�
 - 首页 **Upload** → `open({ multiple: true, directory: false })` 选本地文件 →
   `queue_upload_paths()` 入队 → 打开上传窗口（带上当前目录作为目标目录建议）。
 - 上传窗口**默认隐藏**，关闭时只 `hide()` 不销毁，因此上传状态不会丢；
-  有任务在上传时会先弹确认，确认后取消并清理（详见下文「关闭上传窗口」）。
+  有任务在上传时会先弹确认，确认后**暂停**上传（保留已完成的进度）再隐藏，
+  详见下文「关闭上传窗口」。
 - 上传窗口在**登录页 / 初始化 / 断网重试**期间也由 `App.vue` 的关闭守卫保护：
   任何情况下都不会被销毁，只隐藏，保证 `open_upload_window` 始终能找回它。
 
@@ -259,42 +260,85 @@ notes:logout         某个窗口退出 / 令牌被判定失效 -> 其它窗口�
 （**只有账号名，没有 JWT**）。会话被清空、登录、或登录账号发生变化时都会派发一次，
 用于丢掉上一个账号遗留的状态，**避免新账号复用旧的目录 ID、上传队列或恢复任务**：
 
-- `upload.ts`：**先请求取消**，并在任何 `await` 之前重算 `uploadState.tasks` 与清空目标目录，
-  **再**对上一会话的上传做有界等待；被移出界面的任务对象仍被 worker 持有，
-  会照常走完取消/清理。任务的取舍见下一节。
+- `upload.ts`：**先请求暂停**（不是取消），并在任何 `await` 之前重算 `uploadState.tasks`
+  与清空目标目录，**再**把 PAUSED 落盘、对上一会话的上传做有界等待；被移出界面的任务对象
+  仍被 worker 持有，会照常走完暂停/清理。任务的取舍见下一节。
 - `UploadView`：目标为空**且没有上传在跑**时加载当前账号自己的 root
   （同时监听 `target.length` 与 `running`，因此上一会话的上传收尾后也能补上初始化）。
 - `HomeView`：清空面包屑/列表，并在仍处于登录态时重新 `loadRoot()`。
 
 订阅者出错不会影响其它订阅者，也不会阻塞认证流程（清理本身是异步的）。
 
-#### 恢复任务（metadata-pending）如何跨重新登录保留
+#### 恢复类任务如何跨会话保留
 
-**可恢复任务的定义**：`objectUploaded === true && status !== 'success'`，
-也就是"OSS 对象**已经完整上传**，但 `/api/file/insert/` 还没成功"。
-每个任务在创建时都会打上 `ownerUsername`（**只记账号名，绝不记 JWT**）。
+有两类"可恢复任务"，都会给任务打上 `ownerUsername`（**只记账号名，绝不记 JWT**）：
+
+| 类别 | 定义 | 落盘 |
+| --- | --- | --- |
+| 元数据待补写 | `objectUploaded === true && status !== 'success'`（UI 状态 `metadata_pending`） | `upload-checkpoints.json` 的 `METADATA_PENDING` 记录 |
+| 已暂停的续传 | UI 状态 `paused`（对应 `PAUSED` / `TRANSFERRING` 记录） | `upload-checkpoints.json` 的 `PAUSED` / `TRANSFERRING` 记录 |
 
 会话变化时的取舍规则（其余任务一律清掉，与之前一致）：
 
 | 场景 | `previousUsername` → `currentUsername` | 保留谁 |
 | --- | --- | --- |
-| 退出登录 / 令牌失效 | `A` → `''` | `A` 的恢复任务（等它回来补写元数据） |
-| 同一账号重新登录 | `''` → `A` | `A` 的恢复任务继续可重试 |
+| 退出登录 / 令牌失效 | `A` → `''` | `A` 的恢复类任务（等它回来继续 / 补写元数据） |
+| 同一账号重新登录 | `''` → `A` | `A` 的恢复类任务继续可重试 |
 | 换账号登录（本地或远端） | `A` → `B` | 只留 `B` 的；**`A` 的全部丢弃** |
 
 即 `keepUsername = currentUsername || previousUsername`，只有
-`isMetadataPendingTask(task) && task.ownerUsername === keepUsername` 的任务会被保留。
-**一个账号的待办永远不会出现在另一个账号的界面里。**
+`(isMetadataPendingTask(task) || status 为 paused/pausing) && task.ownerUsername === keepUsername`
+的任务会被保留。**一个账号的待办永远不会出现在另一个账号的界面里**；
+上传窗口 mount 时还会从 `upload-checkpoints.json` 里按 `ownerUsername` 重新恢复本账号的记录。
 
-重试行为：
+重试 / 继续行为：
 
 - 只用**当时最新的**访问令牌（`getAccessToken()`），不会保存或复用旧令牌；
-- 只走补写元数据的分支（`/api/file/insert/`），**绝不重传 OSS 对象**；
-- 因此即使重新登录后换了目标目录也不影响它——补写用的是上传成功时保存的
-  `uploadedPath` / `uploadedParentId` / `uploadedFilename` 快照。
+- 元数据待补写的任务只走补写分支（`/api/file/insert/`），**绝不重传 OSS 对象**；
+  补写用的是 Complete 成功时冻结的 `targetStringOfPath` / `targetParentId` / `targetFilename`
+  快照（与 `metadataTarget` 一起写在 checkpoint 里）；
+- 暂停的续传任务只补传**本地没有记录的分片号**，uploadId 与已完成分片全部复用；
+- 这两类任务都**只能继续/重试**，`removeTask` / `clearFinishedTasks` / `clearAllTasks`
+  都不会丢弃元数据待补写的任务——丢掉它等于制造一个用户看不见也删不掉的 OSS 孤儿对象。
 
-其他约束：恢复任务**只存在于内存**，不落盘，应用重启即丢弃（本项目没有为上传队列
-设计持久化机制）；这类任务仍然只能 Retry，不能被 Remove / Clear。
+两类任务都会**持久化**：应用重启后由上传窗口从 `upload-checkpoints.json` 恢复，
+恢复出来的状态一律是"暂停 / 待补写"，**不会自动开始**，由用户决定继续还是取消。
+
+#### 断点续传 checkpoint（`upload-checkpoints.json`）
+
+独立于 `auth.json` / `settings.json` 的第三个 Store 文件（`src/config.ts` 的
+`UPLOAD_CHECKPOINT_STORE_FILE`），整个文件只用一个 key（`uploadCheckpoints`），
+值是 `transferId -> 记录` 的映射。**绝不写入任何凭据**：没有 JWT、没有 AccessKey、
+没有 SecurityToken——STS 只活在内存里，重启后重新申请即可。
+
+```text
+schemaVersion      当前 1；不一致的记录整条丢弃（绝不猜字段含义）
+transferId         稳定 id，同时就是 UploadTask.id 与 Store 的 key
+ownerUsername      账号名（用于跨账号隔离；不是凭据）
+source             { path, filename, size, modifiedAtMs }   ← 本地源身份
+target             { parentId, stringOfPath, filename }     ← 冻结的传输目标
+objectKey          OSS 对象键（刷新 STS 时必须保持一致）
+uploadId           空串表示"还没 init"
+partSize           本次传输使用的分片大小（中途改过配置也能正确续传）
+parts              [{ partNumber, etag, size }]  ← 唯一的权威分片表
+phase              TRANSFERRING | PAUSED | METADATA_PENDING
+metadataTarget     METADATA_PENDING 专用的落库快照（Complete 那一刻抄下来的 target）
+overwrite          后端 same_file_name 的覆盖标记（只用于提示）
+createdAtMs / updatedAtMs
+```
+
+写入纪律（`src/services/upload-checkpoints.ts`）：
+
+- **串行落盘**：所有写操作排在同一条 Promise 链上，并且真正 flush 时读的是
+  **当前内存缓存**而不是排队时刻的快照——因此 3 个 worker 并发记录 ETag 时，
+  后完成的分片绝不会覆盖先完成分片刚写下的记录。
+- **每个分片成功后立即落盘**；进程在"OSS 已接受分片"与"本地记下 ETag"之间崩溃也没关系，
+  下次 Resume 会重传那一个 partNumber（OSS 允许覆盖）。
+- **损坏即丢弃**：读失败、字段非法、schema 版本不认识、ETag 为空、分片号重复……
+  只要有一样不合法就整条丢掉，界面上给出"部分续传记录已损坏并被丢弃"的提示。
+  一份"大部分可用"的 ETag 列表是最危险的东西——它足以让 Complete 通过校验，
+  却合成出一个内容错误的对象。
+- 丢弃一条记录只会让那个文件重新上传一遍；被遗留的远端分片由 OSS 生命周期规则回收。
 
 #### 认证请求的代际号（防止过期响应覆盖新登录）
 
@@ -352,46 +396,69 @@ generation === authGeneration && verifiedToken === accessToken
 1. UploadActivity == false  -> 直接退出
 2. UploadActivity == true   ->
      a. Rust 广播 notes:prepare-exit
-     b. 上传窗口：请求取消 -> 等真正 idle（含 best-effort abortMultipartUpload 与 worker 退出）
+     b. 上传窗口：请求【暂停】（持久化 checkpoint、停止调度新分片，【不】abort multipart）
+        -> 有界等待在途分片收尾（UPLOAD_CLEANUP_TIMEOUT_MS = 3s）
      c. 上传窗口回报 confirm_exit_ready
      d. Rust 最多等 EXIT_CLEANUP_TIMEOUT_MS = 5s，超时也会退出
 ```
 
 等待在 Rust 侧的一个普通线程里完成，不依赖异步运行时是否还活着，
-所以 OSS abort 失败或上传窗口无响应都**不会**让退出无限阻塞。
-首页与上传窗口会分别显示"正在退出…"与"正在取消上传并清理未完成的分片…"。
+所以 OSS 请求慢或上传窗口无响应都**不会**让退出无限阻塞——
+**关机绝不会去等一个最长 180 秒的在途 OSS 请求**。
+首页与上传窗口会分别显示"正在退出…"与"应用正在退出：正在暂停上传并保存进度，下次启动可以继续…"。
 
-### 关闭上传窗口：取消与收尾的顺序
+进程带着在途分片退出是安全的：那个"服务端已接受、本地还没记下 ETag"的分片，
+下次 Resume 会用**同一个 partNumber** 重传，OSS 允许覆盖同一个分片号，Complete 用的是本地最终列表。
+
+### 关闭上传窗口：暂停与收尾的顺序
 
 ```text
-请求取消（abort signal + 立刻发一次 best-effort abortMultipartUpload）
-  -> 等上传真正 idle（其中包含完整的 multipart 清理）-> 才隐藏窗口
+请求暂停（停止调度新分片、把 PAUSED 落盘、有界等待在途分片收尾）
+  -> 才隐藏窗口        （关闭窗口 ≠ 取消，multipart 与 checkpoint 全部保留）
 ```
 
-- 有上传在跑时先弹确认；确认后进入取消流程。
-- 取消时会**立刻**对进行中的 multipart 发一次 `abortMultipartUpload`，
-  不必等当前分片请求返回——但这是"尽早发出清理请求"，
-  **不等于**在途分片会立即终止（HTTP 请求无法强制中断）。
-- multipart 自己的失败/取消路径仍然完整执行：
-  `abort` → `Promise.allSettled(workers)` → 再 abort 一次（清掉第一次之后才完成的分片）。
-- 如果超过 `UPLOAD_CLEANUP_TIMEOUT_MS = 3s` 还没收尾，
-  **窗口保持可见**并显示"正在取消上传并清理未完成的分片…"，
-  后台继续等待真正 idle 后再隐藏——**不会假装上传已经停了**。
-- 期间重复点关闭不会重复取消；如果用户在这段时间又发起了新上传，则不会把窗口藏起来。
+- 有上传在跑时先弹确认；确认后进入暂停流程。
+- **暂停不会**调用 `abortMultipartUpload`：uploadId 与所有已完成分片记录都保留。
+- 为什么不用 `client.cancel()` 让暂停更跟手：本地安装的 ali-oss 6.23.0 里
+  `cancel()`（`lib/common/parallel.js`）只做两件事——置 `options.cancelFlag = true`、
+  销毁 `multipartUploadStreams`（Node 流式上传才有的东西）。它**不会**中断浏览器端已经发出的
+  XHR，本项目也没有使用会读 `cancelFlag` 的 `_parallel` / managed-upload 路径。
+  因此暂停选择"让至多 3 个在途分片跑到安全边界"：响应稍慢一点，但语义完全正确。
+- 如果超过 `UPLOAD_CLEANUP_TIMEOUT_MS = 3s` 还没收尾，窗口照常隐藏：
+  checkpoint 已经落盘，续传正确性不依赖在途请求的返回。
+- 期间重复点关闭不会重复暂停。
+
+#### 显式"取消上传"才是破坏性路径
+
+界面上的 `取消上传`（窗口级与单条任务级）是唯一会销毁远端状态的入口：
+
+```text
+1. 阻止新分片被调度（abort signal）
+2. 立刻发一次 best-effort abortMultipartUpload（不等在途分片返回）
+3. 等 worker 真正退出
+4. 再 abort 一次（清掉第一次 abort 之后才完成的分片）
+5. 删除本地 checkpoint
+6. 任务标记为已取消
+```
+
+只有三种情况会销毁旧 multipart：**显式取消**、**本地源身份变化**、**明确不可恢复的任务失效**。
+暂停、正常退出、退出登录、换账号都**不会**。
 
 ### ⚠️ 取消是"尽力而为"，不是保证
 
-**不要指望退出/取消时 OSS 上的分片一定被清干净。** 实际情况是：
+**不要指望取消时 OSS 上的分片一定被清干净。** 实际情况是：
 
 - 已经发出的分片 HTTP 请求**无法被强制中断**（`ali-oss` 没有暴露该能力），
   只能等它自己返回或超时。取消时我们能做的是：
   设置取消标志、立刻**发出**一次 best-effort `abortMultipartUpload`（早发请求，不是立即终止）、
   停止启动新的分片、等 worker 退出后再补一次 abort，并且**有界等待**后就不再拖延退出。
 - 因此下列情况都可能留下**未完成的 multipart 分片**：
-  网络卡死导致单个请求直到 180s 超时才返回、进程崩溃、被任务管理器强杀、
-  断电，以及退出等待（Rust 侧 5s）先于分片请求超时。
+  网络卡死导致单个请求直到 180s 超时才返回、进程崩溃、被任务管理器强杀、断电，
+  **以及"暂停 / 正常退出"这种刻意保留 multipart 的情况**。
 - 这些残留分片既不会被合并成对象，也不会出现在 `files` 表里，
   但会占用 OSS 存储空间。
+- 残留分片不再等于数据丢失：只要本地 checkpoint 还在，下次 Resume 就能接着传完；
+  只有 checkpoint 也一起丢失（例如用户手工删了应用数据目录）才会退化成"重新上传"。
 
 **最终兜底机制是 OSS 生命周期规则**，请在目标 Bucket 上配置一条
 「删除过期未完成的分片」（`AbortMultipartUpload`）规则，例如：
@@ -439,20 +506,21 @@ Rust 存 hint -> emit 通知 -> UploadView 收到通知 -> take_upload_target_hi
 
 首页顶部 **Upload** 会在**打开文件选择器之前**与**返回之后**各检查一次；
 两个状态**互补**，任一为真都直接拒绝新批次，
-提示"已有上传正在进行"并聚焦已有上传窗口：
+提示"上传窗口里还有未处理的任务"并聚焦已有上传窗口：
 
 | | 含义 | 谁写 | 谁读 |
 | --- | --- | --- | --- |
 | `UploadActivity` | 此刻是否有上传在跑 | 上传流程（startUpload 起止） | 退出逻辑、首页关闭确认、**首页开新批次前** |
 | `UploadBatchBusy` | 这一批是否仍占着目标目录 | **只由上传窗口**在任务列表变化时写 | 首页开新批次前 |
 
-只看 `upload_active()` 是不够的：队列里还躺着待上传 / 失败任务时它是 false，
+只看 `upload_active()` 是不够的：队列里还躺着待上传 / 已暂停 / 失败任务时它是 false，
 但那一批仍然占着**全局唯一的目标目录**。
 所以另有一个独立状态 `UploadBatchBusy`（**刻意与 `UploadActivity` 分开**，退出语义不变）。
 
 `UploadBatchBusy` 的判定规则：列表里**只要还有没成功的任务**
-（待上传 / 上传中 / 失败 / 已取消，含只差补写元数据的）就算占用中；
-全部成功或列表被清空后才释放。会话切换时由 `upload.ts` 的清理路径兜底置为 false。
+（待上传 / 上传中 / 已暂停 / 失败 / 已取消，含只差补写元数据的）就算占用中；
+全部成功或列表被清空后才释放。上传窗口 mount 时从 checkpoint 恢复出来的任务同样算占用中。
+会话切换时由 `upload.ts` 的清理路径兜底重算。
 
 **状态查询失败时 fail closed**：两次检查里任何一个 Rust 查询出错，都按"不允许开新批次"处理
 （同样提示并聚焦），绝不放过"两批共用同一个目标目录"的情况。
@@ -533,31 +601,41 @@ HKCU\Software\Classes\*\shell\NotesUpload\command
 | 空文件 | `client.put(objectKey, new Blob([]))`，成功后再 insert |
 | 目标路径 | `breadcrumbs.map(i => `${i.id}/`).join('')`，例如 `1/12/34/` |
 | 进度 | OSS 阶段最多 99%，insert 成功后才 100% |
+| 断点续传 | `upload-checkpoints.json`（独立 Store 文件），阶段 `TRANSFERRING` / `PAUSED` / `METADATA_PENDING` |
 
 其他要点：
 
-- 本地文件通过 Rust 命令 `read_file_chunk(path, offset, length)` 分片读取，
-  用 `tauri::ipc::Response::new(bytes)` 以**原始二进制**返回（无 base64、无 JSON）。
-  每次都是打开 → seek → 读取 → 函数结束 RAII 关闭，不存在常驻文件句柄。
-- 只保留 `{ number, etag }`，每个分片用完立即释放 `Uint8Array / ArrayBuffer / Blob` 引用，
+- 本地文件通过 Rust 命令 `read_file_chunk(path, offset, length, expectedSize, expectedModifiedAtMs)`
+  分片读取，用 `tauri::ipc::Response::new(bytes)` 以**原始二进制**返回（无 base64、无 JSON）。
+  每次都是打开 → 校验源快照 → seek → 读取 → **按路径再校验一次** → 函数结束 RAII 关闭，
+  不存在常驻文件句柄。
+- 只保留 `{ partNumber, etag, size }`，每个分片用完立即释放 `Uint8Array / ArrayBuffer / Blob` 引用，
   因此内存占用不随文件大小线性增长（GB 级文件同样如此）。
-- 重试只针对失败分片，已完成分片不重传；严重失败或用户取消会 best-effort
-  `abortMultipartUpload`，abort 自身失败不会覆盖原始错误。
+- 重试只针对失败分片，已完成分片不重传；**可恢复失败不再 abort multipart**——
+  checkpoint 与已完成分片全部保留，任务落到"已中断（可继续）"，点继续就从断点接着传。
 - 分片 worker 共享一个 `stopScheduling` 标记：任一 worker **最终失败**时先置位，
   其它 worker 完成手头在途的分片后立即退出，不再领取新分片。
-  这不会改变 abort 架构（仍是 abort → `Promise.allSettled(workers)` → 再 abort 一次），
-  只是避免在第一次 abort 生效前白白继续上传、拖长取消时间。
-- insert 失败时明确提示 **“OSS 已上传成功，但文件元数据写入失败”**。
+- 每个分片成功后：① 记下 ETag → ② 更新内存里的权威分片表 → ③ 串行落盘 checkpoint。
+  **本地 PartNumber + ETag 是唯一事实来源**，Complete 只用这份列表（升序），
+  绝不从 `ListParts` 反推——本地缺哪个分片号就重传哪个，比信任未经验证的服务端列表更安全。
+- insert 失败时明确提示 **“OSS 已上传成功，但文件元数据写入失败”**，进度停在 99%。
   再次重试**只补写数据库**，不会偷偷重传整个文件，而且这个补写是自洽的：
 
-  - 上传成功时会把 `uploadedPath` / `uploadedParentId` / `uploadedFilename` 三个快照记在任务上；
+  - Complete 成功、调用 insert **之前**会把阶段落盘为 `METADATA_PENDING`
+    （含 `metadataTarget` 落库快照），因此进程崩溃/重启后仍然只会补写元数据；
   - 重试时**先走补写分支**：不 `stat` 本地文件（文件可能已被删除/移动），也不看当前 UI 目标目录；
   - 因此即使用户改了目标目录，也不会"重新上传一遍"而把原来那个已经完整上传、
     数据库里却没有记录的 OSS object 永久遗留。
   - 这类任务（`objectUploaded && status !== 'success'`）**只能 Retry**：
     `removeTask` / `clearFinishedTasks` / `clearAllTasks` 都会保留它，
     界面上也不提供"移除"按钮——丢掉它等于制造一个用户看不见也删不掉的 OSS 孤儿对象。
-- 同目录同名：后端返回 `same_file_name` 时给出简短覆盖提示并继续上传（沿用后端覆盖语义）。
+- 同目录同名：后端返回 `same_file_name` 时给出简短覆盖提示并继续上传（沿用后端覆盖语义，
+  last-completer-wins）；**STS 静默刷新不会重复弹这条提示**。
+- STS 凭证：`expiration` 解析成绝对 UTC 毫秒 + 60 秒安全余量，
+  接近过期就在下一个 OSS 请求之前静默重新申请 `/api/oss/sts/`。
+  刷新只换 client，**不改变 objectKey 与 uploadId**；3 个 worker 共享同一个 in-flight 刷新
+  Promise，并且用"凭证代际号"判断某次 403 是否值得再申请一次 STS——
+  因此并发分片同时撞上凭证过期时只会产生 **1 次**刷新请求。
 - **登录态失效（后端 tokenVersion 机制）**在接口层表现为 HTTP **401 / 403**，
   上传流程把它识别为“会话过期”而不是普通上传失败：
 
@@ -566,7 +644,7 @@ HKCU\Software\Classes\*\shell\NotesUpload\command
   | 提示 | 显示 **“登录状态已失效，请重新登录”**；若 OSS 对象已传完，追加“登录后重试只会补写元数据” |
   | 重试 | **不重试**。`isRetryableError` 明确把 401/403 排除在外，分片重试、空文件重传都不会覆盖它 |
   | 当前请求 | 上传流程自身遇到 401/403 时**不主动清任务、不清目标目录、不触发 `logout()`** |
-  | 恢复状态 | 已经 OSS 完成的（99%）任务保持 99% 与 `uploadedPath` / `uploadedParentId` / `uploadedFilename` 快照；会话变化时仅保留属于相应账号的 metadata-pending 任务，重新登录后可继续补写元数据、不重传文件 |
+  | 恢复状态 | 已经 OSS 完成的（99%）任务保持 99% 与 `targetStringOfPath` / `targetParentId` / `targetFilename` 快照（checkpoint 里另存为 `metadataTarget`）；会话变化时保留属于相应账号的元数据待补写与已暂停任务，重新登录后可继续补写元数据 / 继续续传，不重传已完成的 OSS 对象 |
 
   这里不由上传流程直接触发 `logout()`：401/403 发生时 OSS 上可能已经存在完整对象，
   直接清掉恢复任务会制造用户无法管理的孤儿对象。
@@ -621,7 +699,8 @@ macOS / iOS / Linux: tauri://localhost
     并用 `disposed` 标志保证异步回调不再写已销毁组件的状态；
   - 上传取消时先**尽早发出**一次 best-effort `abortMultipartUpload`（这只是清理请求，
     已经发出的分片 HTTP 请求不会因此立即终止），再 `Promise.allSettled` 等所有
-    worker 退出并补一次 abort，不留游离的分片上传任务。
+    worker 退出并补一次 abort，不留游离的分片上传任务。**只有显式取消走这条路**，
+    暂停 / 正常退出只做 checkpoint 落盘 + 有界等待。
 - Windows 专属代码（含 `winreg` 依赖）全部位于 `cfg(target_os = "windows")` 之内，
   macOS / Linux 可以正常编译，也不会链接 `winreg`。
 
@@ -647,7 +726,10 @@ src/
     auth.ts                Tauri Store 持久化 + auto-login + 跨窗口广播 + 认证代际号
     settings.ts            应用偏好（右键菜单开关）
     filesystem.ts          Rust 命令封装
-    upload.ts              唯一的上传实现（UploadService）
+    upload.ts              唯一的上传实现（UploadService：暂停 / 继续 / 取消 / 恢复）
+    upload-checkpoints.ts  断点续传 checkpoint 的持久化（独立 Store 文件 + 串行写入）
+    transfer-credentials.ts 任务级 STS 凭证 / client 管理器（过期刷新 + 去重）
+    upload-errors.ts       上传流程共用的错误类型
     events.ts              事件名（跨窗口 + Rust）
   types/
   utils/
@@ -679,9 +761,15 @@ src-tauri/
 
 - macOS / Linux 的 `shell_integration` 为 Unsupported / No-op（只保留模块边界，
   不影响编译，也不影响主页与上传窗口）。
-- **取消 / 退出时的 OSS 清理是尽力而为，不是保证**：
+- **暂停 / 正常退出会刻意保留 multipart**：这是续传的前提，不是泄漏。
+  未完成的分片在 Resume 之前会一直占用 OSS 存储空间。
+- **取消时的 OSS 清理是尽力而为，不是保证**：
   已经发出的分片请求无法强制中断，取消只是停止启动新分片 + best-effort
   `abortMultipartUpload`，并且有界等待后不再拖延退出。
   网络卡死、崩溃、强杀、断电都可能留下未完成的分片，
-  **必须依赖 Bucket 的「删除过期未完成分片」生命周期规则做最终回收**（见 §4）。
-- 断点续传不在范围内：取消或失败后重试会从 STS 重新开始。
+  **仍然建议给 Bucket 配置「删除过期未完成分片」生命周期规则做最终回收**（见 §4）。
+  注意这条规则也会回收"暂停中"的 multipart：如果暂停超过规则的天数，
+  Resume 会收到 `NoSuchUpload`，此时客户端会**丢弃旧 checkpoint 并干净地重新上传**。
+- 本地源身份用 **(规范路径, 大小, mtime)** 判断，不做全文件哈希：
+  哈希等于给每个大文件额外加一次完整读取，对个人客户端不划算。
+  代价是"内容变了但大小与 mtime 都被刻意改回原值"这种情况检测不出来。

@@ -31,7 +31,8 @@ pub struct UploadTargetHint(Mutex<Option<UploadTarget>>);
 /// 上传活动状态。
 ///
 /// 由上传窗口在上传**真正开始**时置 `true`，在整轮上传的最终清理路径
-/// （`startUpload()` 的 `finally`）里置 `false`。
+/// （`startUpload()` 的 `finally`）里置 `false`——**暂停也会走到那条清理路径**，
+/// 因此暂停之后这个状态自然变回 false，退出逻辑不会误以为还有上传在跑。
 ///
 /// 退出逻辑只认这个状态，**不再**用"上传窗口是否可见"作为是否在上传的依据：
 /// 窗口可见 ≠ 正在上传，窗口隐藏也可能有一个还没收尾的任务。

@@ -21,11 +21,19 @@ pub const EVENT_UPLOAD_TARGET: &str = "notes:upload-target";
 /// 前端分片为 5 MiB，这里留出余量并硬性限制，避免前端传入超大 length 撑爆内存。
 pub const MAX_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 
-/// Rust -> 上传窗口：主窗口要退出了，请取消上传并完成清理。
+/// Rust -> 上传窗口：主窗口要退出了，请**暂停**上传并完成清理。
+///
+/// 注意语义：暂停 ≠ 取消。收到这个事件后前端只做三件事——
+/// 持久化 checkpoint、停止调度新分片、有界地等在途分片收尾；
+/// **绝不**调用 AbortMultipartUpload，multipart 留待下次启动继续。
 pub const EVENT_PREPARE_EXIT: &str = "notes:prepare-exit";
 
 /// 退出前等待上传窗口回报"清理完成"的总超时（毫秒）。
-/// 超时后无条件退出：OSS abort 失败、上传窗口无响应都不能卡死进程。
+///
+/// 超时后无条件退出：OSS 请求慢、上传窗口无响应都不能卡死进程。
+/// 这个值必须明显小于前端上传窗口自己的有界等待（UPLOAD_CLEANUP_TIMEOUT_MS），
+/// 更要远小于单个 OSS 请求 180 秒的超时——退出时**绝不会**去等一个在途请求。
+/// 带着在途分片退出是安全的：那个未被记录的分片下次会用同一个 partNumber 重传。
 pub const EXIT_CLEANUP_TIMEOUT_MS: u64 = 5000;
 
 /// 等待退出握手的轮询间隔（毫秒）。

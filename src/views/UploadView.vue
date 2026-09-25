@@ -8,6 +8,13 @@
  *
  * 事件只做"有新内容了"的通知，真正的数据始终在 Rust 侧队列里，
  * 因此不存在"listener 尚未初始化导致路径丢失"的问题。
+ *
+ * 断点续传：本窗口 mount 时会从 `upload-checkpoints.json` 恢复**当前账号**的
+ * 未完成任务（paused / METADATA_PENDING）。恢复出来的任务一律不会自动开始，
+ * 由用户决定继续还是放弃。
+ *
+ * 关闭窗口 / 应用退出 = **暂停**，不是取消：multipart 与 checkpoint 全部保留，
+ * 下次打开（或下次启动）还能继续。只有显式点"取消上传"才是破坏性操作。
  */
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
@@ -19,7 +26,7 @@ import DirectoryPicker from '../components/DirectoryPicker.vue'
 import UploadItem from '../components/UploadItem.vue'
 import { UPLOAD_CLEANUP_TIMEOUT_MS } from '../config'
 import { fetchRoot, isAuthFailure } from '../services/api'
-import { getAccessToken, logout } from '../services/auth'
+import { getAccessToken, logout, onSessionChanged } from '../services/auth'
 import {
   confirmExitReady,
   setUploadBatchBusy,
@@ -28,18 +35,20 @@ import {
 } from '../services/filesystem'
 import {
   addPaths,
+  cancelTask,
   cancelUpload,
-  clearAllTasks,
+  checkpointsRestoreFailed,
   clearFinishedTasks,
   disposeUpload,
   getUploadSessionGeneration,
+  pauseUploads,
   removeTask,
-  retryTask,
+  restoreUploadCheckpoints,
+  resumeTask,
   setUploadTarget,
   startUpload,
   uploadOverallProgress,
   uploadState,
-  waitForUploadIdle,
   waitForUploadIdleBounded
 } from '../services/upload'
 import {
@@ -47,26 +56,37 @@ import {
   EVENT_UPLOAD_PENDING,
   EVENT_UPLOAD_TARGET
 } from '../services/events'
-import type { Breadcrumb } from '../types'
+import type { Breadcrumb, UploadStatus } from '../types'
 import { formatBytes, formatPercent } from '../utils/format'
 import { createListenerRegistry } from '../utils/listeners'
 
 const pickerOpen = ref(false)
 const preparingExit = ref(false)
+const pausing = ref(false)
+const cancelling = ref(false)
 const errorMessage = ref('')
 const hintMessage = ref('')
 
 const tasks = computed(() => uploadState.tasks)
 
-const canUpload = computed(
-  () =>
-    !uploadState.running &&
-    uploadState.tasks.some(
-      (task) =>
-        task.status === 'pending' ||
-        task.status === 'error' ||
-        task.status === 'canceled'
-    )
+/** 能"继续上传"的任务：暂停 / 可恢复错误 / 已取消 / 元数据待补写。 */
+const RESUMABLE_STATUSES: ReadonlySet<UploadStatus> = new Set<UploadStatus>([
+  'pending',
+  'paused',
+  'error',
+  'canceled',
+  'metadata_pending'
+])
+
+const hasResumable = computed(() =>
+  uploadState.tasks.some((task) => RESUMABLE_STATUSES.has(task.status))
+)
+
+const canUpload = computed(() => !uploadState.running && hasResumable)
+
+/** 有 paused 任务时，"取消上传"才是需要单独暴露的破坏性动作。 */
+const hasDestructible = computed(() =>
+  uploadState.tasks.some((task) => task.status === 'paused')
 )
 
 const hasFinished = computed(() =>
@@ -78,9 +98,12 @@ const hasFinished = computed(() =>
   )
 )
 
-const cancelLabel = computed(() =>
-  uploadState.running ? '取消上传' : '清空列表'
-)
+const primaryLabel = computed(() => {
+  if (uploadState.running) return '上传中…'
+  if (uploadState.tasks.some((task) => task.status === 'paused')) return '继续上传'
+  if (hasResumable.value) return '继续上传'
+  return 'Upload'
+})
 
 const targetSize = computed(() =>
   uploadState.tasks.reduce((sum, task) => sum + Math.max(task.size, 1), 0)
@@ -130,6 +153,33 @@ const initializeTarget = async (): Promise<void> => {
     errorMessage.value = `无法读取根目录：${
       error instanceof Error ? error.message : '未知错误'
     }`
+  }
+}
+
+/**
+ * 恢复本账号的续传任务（paused / METADATA_PENDING）。
+ *
+ * 放在目标目录初始化之后：恢复出来的任务用的是它自己冻结的目标快照，
+ * 与当前浏览目录无关，但界面先有目录更符合用户预期。
+ */
+const restoreCheckpoints = async (): Promise<void> => {
+  const generation = getUploadSessionGeneration()
+
+  try {
+    const restored = await restoreUploadCheckpoints()
+
+    if (disposed || generation !== getUploadSessionGeneration()) return
+
+    if (restored > 0) {
+      hintMessage.value = `已恢复 ${restored} 个未完成的上传任务，可以继续或取消`
+    }
+
+    if (checkpointsRestoreFailed()) {
+      errorMessage.value =
+        '部分续传记录已损坏并被丢弃（相关文件需要重新上传），其余任务不受影响。'
+    }
+  } catch {
+    // 恢复失败只影响"能不能续传"，不影响新上传。
   }
 }
 
@@ -201,8 +251,8 @@ watch(
 /**
  * 把"这一批是否已被占用"同步给 Rust。
  *
- * 只要列表里还有**没成功的任务**（待上传 / 上传中 / 失败 / 已取消，含只差补写元数据的），
- * 就算占用中——这样首页不会在前一批还没处理完时再开一批、
+ * 只要列表里还有**没成功的任务**（待上传 / 上传中 / 已暂停 / 失败 / 已取消，
+ * 含只差补写元数据的），就算占用中——这样首页不会在前一批还没处理完时再开一批、
  * 让两批共用同一个全局目标目录。
  *
  * 只有上传窗口会写这个状态（首页只读），避免主窗口的空列表把它清掉。
@@ -271,29 +321,120 @@ const handleUpload = async (): Promise<void> => {
     return
   }
 
+  if (disposed) return
+
   if (!errorMessage.value) {
     const failed = uploadState.tasks.filter((task) => task.status === 'error').length
+    const paused = uploadState.tasks.filter((task) => task.status === 'paused').length
 
     if (failed === 0 && uploadState.tasks.every((task) => task.status === 'success')) {
       hintMessage.value = '全部文件上传完成'
+    } else if (paused > 0) {
+      hintMessage.value = `${paused} 个文件已暂停，可以继续`
     } else if (failed > 0) {
-      hintMessage.value = `${failed} 个文件上传失败，可单条重试`
+      hintMessage.value = `${failed} 个文件上传中断，进度已保留，可继续`
     }
   }
 }
 
-const handleCancel = (): void => {
-  if (uploadState.running) {
-    cancelUpload()
-    return
+/** 暂停：保留 uploadId 与已完成分片，**绝不** abort multipart。 */
+const handlePause = async (): Promise<void> => {
+  if (pausing.value) return
+
+  pausing.value = true
+  hintMessage.value = '正在暂停上传，已完成的进度会保留…'
+
+  try {
+    await pauseUploads()
+  } catch {
+    // 暂停本身不会失败（落盘失败也只是少一个恢复点）。
   }
 
-  clearAllTasks()
+  const idle = await waitForIdle(UPLOAD_CLEANUP_TIMEOUT_MS)
+
+  if (disposed) return
+
+  pausing.value = false
+  hintMessage.value = idle
+    ? '已暂停，可随时继续'
+    : '正在等在途分片收尾，进度已经保存，可随时继续'
+}
+
+/** 破坏性取消：abort multipart + 删除本地 checkpoint。 */
+const handleCancel = async (): Promise<void> => {
+  if (cancelling.value) return
+
+  let confirmed = false
+
+  try {
+    confirmed = await confirmDialog(
+      '取消上传会中止未完成的分片上传，并删除本地续传记录（已上传的部分将被丢弃）。确定取消吗？',
+      {
+        title: '取消上传',
+        kind: 'warning',
+        okLabel: '取消上传',
+        cancelLabel: '继续上传'
+      }
+    )
+  } catch {
+    confirmed = false
+  }
+
+  if (!confirmed || disposed) return
+
+  cancelling.value = true
+
+  try {
+    await cancelUpload()
+    await waitForIdle(UPLOAD_CLEANUP_TIMEOUT_MS)
+  } finally {
+    if (!disposed) {
+      cancelling.value = false
+    }
+  }
 }
 
 const handleSelectTarget = (breadcrumbs: Breadcrumb[]): void => {
   setUploadTarget(breadcrumbs)
   pickerOpen.value = false
+}
+
+/**
+ * 单条任务的"暂停"。
+ *
+ * 同一时刻只有一个文件在传（串行队列），所以它与窗口级的暂停是同一件事：
+ * 停在当前文件的安全边界，已完成的分片与 uploadId 全部保留。
+ */
+const handleTaskPause = async (): Promise<void> => {
+  await handlePause()
+}
+
+/**
+ * 单条任务的"取消上传"（破坏性）。
+ *
+ * 只对**暂停中**的任务暴露：它会 abort 这个任务残留的 multipart 并删除 checkpoint。
+ * 正在上传的任务必须走窗口级的"取消上传"，因为中断在途 worker 只有一个信号源。
+ */
+const handleTaskCancel = async (taskId: string): Promise<void> => {
+  let confirmed = false
+
+  try {
+    confirmed = await confirmDialog(
+      '取消这一项会中止它的分片上传并删除本地续传记录，已上传的部分将被丢弃。确定吗？',
+      {
+        title: '取消上传',
+        kind: 'warning',
+        okLabel: '取消上传',
+        cancelLabel: '保留'
+      }
+    )
+  } catch {
+    confirmed = false
+  }
+
+  if (!confirmed || disposed) return
+
+  await cancelTask(taskId)
 }
 
 /**
@@ -319,24 +460,28 @@ const listeners = createListenerRegistry()
 /** 组件卸载后不再写任何状态，也不发起新的请求。 */
 let disposed = false
 
-/** 正在等待上传收尾（窗口保持可见，不允许假装已经停下）。 */
-const cancelling = ref(false)
+/** 会话订阅（换账号时重新恢复本账号的续传记录）。 */
+let unsubscribeSession: (() => void) | null = null
 
 /**
- * 退出前清场：取消上传 -> best-effort abort multipart -> 等待清理完成（有上限），
- * 然后告诉 Rust 侧可以退出了。Rust 自己还有超时兜底，这里失败不会卡住退出。
+ * 退出前清场：**暂停**上传（不 abort multipart）-> 有界等待 -> 回报 ready。
+ *
+ * 关键点：
+ *   - 暂停会先把 checkpoint 落盘，因此即使进程带着在途分片退出，
+ *     下次启动也能从这个断点继续；
+ *   - 等待是**有界**的：绝不为了等在途请求而让关机卡到 OSS 的 180 秒超时；
+ *   - Rust 侧本身还有 EXIT_CLEANUP_TIMEOUT_MS 兜底，这里失败不会卡住退出。
  */
 const handlePrepareExit = async (): Promise<void> => {
   preparingExit.value = true
 
-  // 请求取消 -> 等真正 idle（其中包含 best-effort abort multipart 与 worker 退出）。
-  if (uploadState.running) {
-    cancelUpload()
+  try {
+    await pauseUploads()
+  } catch {
+    // 暂停失败也不能让退出流程卡住：checkpoint 在分片成功时就已落盘。
   }
 
-  // 只有在**真正**结束之后才回报 ready；如果一直没收尾，
-  // Rust 侧的 EXIT_CLEANUP_TIMEOUT_MS 会兜底退出，这里不会无限阻塞。
-  await waitForUploadIdle()
+  await waitForIdle(UPLOAD_CLEANUP_TIMEOUT_MS)
 
   try {
     await confirmExitReady()
@@ -346,34 +491,39 @@ const handlePrepareExit = async (): Promise<void> => {
 }
 
 /**
- * 关闭上传窗口：只隐藏不销毁，保证上传状态不丢。
+ * 关闭上传窗口：**暂停**并只隐藏不销毁，保证上传状态不丢。
  *
- * 顺序严格是：请求取消 -> 等上传真正 idle（含 abort multipart）-> 才隐藏。
- * 如果超过有界超时还没收尾，就**保持窗口可见**并进入"正在取消"状态，
- * 后台继续等它真正结束再隐藏——绝不假装上传已经停了。
+ * 顺序严格是：请求暂停 -> 有界等待收尾 -> 隐藏。
+ * 关闭窗口不是取消：multipart 与 checkpoint 都保留着，重新打开就能继续。
  */
 const handleCloseRequested = async (event: {
   preventDefault: () => void
 }): Promise<void> => {
   event.preventDefault()
 
-  // 已经在收尾：重复点关闭不做任何事，避免重复取消/重复隐藏。
-  if (cancelling.value) return
+  // 已经在收尾：重复点关闭不做任何事，避免重复暂停/重复隐藏。
+  if (cancelling.value || pausing.value) return
 
-  const hasPendingWork = uploadState.tasks.some((task) => task.status === 'pending')
+  const hasPendingWork = uploadState.tasks.some((task) => task.status !== 'success')
 
   if (uploadState.running) {
-    const confirmed = await confirmDialog(
-      '上传正在进行。关闭窗口会尝试取消当前上传（尽力 abort 未完成的分片），确定吗？',
-      {
-        title: '取消上传',
-        kind: 'warning',
-        okLabel: '取消上传并关闭',
-        cancelLabel: '继续上传'
-      }
-    )
+    let confirmed = false
 
-    if (!confirmed) return
+    try {
+      confirmed = await confirmDialog(
+        '上传正在进行。关闭窗口会暂停上传并保留已完成的分片，下次打开可以继续。确定吗？',
+        {
+          title: '暂停上传',
+          kind: 'warning',
+          okLabel: '暂停并关闭',
+          cancelLabel: '继续上传'
+        }
+      )
+    } catch {
+      confirmed = false
+    }
+
+    if (!confirmed || disposed) return
   }
 
   if (!uploadState.running && !hasPendingWork) {
@@ -382,29 +532,18 @@ const handleCloseRequested = async (event: {
     return
   }
 
-  cancelUpload()
-  cancelling.value = true
+  pausing.value = true
 
-  const idle = await waitForIdle(UPLOAD_CLEANUP_TIMEOUT_MS)
-
-  if (!idle) {
-    // 超时：窗口保持可见并显示"正在取消"，后台等真正结束再隐藏。
-    void waitForUploadIdle().then(() => {
-      // 组件已经销毁：不要再写 Vue 状态，也不要操作窗口。
-      if (disposed) return
-
-      cancelling.value = false
-
-      // 期间如果用户又发起了新的上传，就不要把窗口藏起来。
-      if (!uploadState.running) {
-        void hideUploadWindow()
-      }
-    })
-
-    return
+  try {
+    await pauseUploads()
+    await waitForIdle(UPLOAD_CLEANUP_TIMEOUT_MS)
+  } catch {
+    // 暂停失败也直接隐藏：checkpoint 已经落盘，续传正确性不受影响。
   }
 
-  cancelling.value = false
+  if (disposed) return
+
+  pausing.value = false
   await hideUploadWindow()
 }
 
@@ -425,7 +564,7 @@ onMounted(async () => {
     })
   )
 
-  // 主窗口退出前会广播这个事件：本窗口负责取消上传并回报清理完成。
+  // 主窗口退出前会广播这个事件：本窗口负责**暂停**上传并回报清理完成。
   await listeners.track(
     listen(EVENT_PREPARE_EXIT, () => {
       void handlePrepareExit()
@@ -438,9 +577,20 @@ onMounted(async () => {
     // 非 Tauri 环境（直接用浏览器跑 vite dev）：忽略。
   }
 
+  // 换账号：上一个账号的任务已被 upload.ts 清掉，这里只恢复新账号自己的续传记录。
+  unsubscribeSession = onSessionChanged(() => {
+    if (disposed) return
+
+    void restoreCheckpoints()
+  })
+
   if (disposed) return
 
   await initializeTarget()
+
+  if (disposed) return
+
+  await restoreCheckpoints()
 
   if (disposed) return
 
@@ -453,6 +603,10 @@ onMounted(async () => {
 
 onUnmounted(() => {
   disposed = true
+
+  unsubscribeSession?.()
+  unsubscribeSession = null
+
   listeners.dispose()
   disposeUpload()
 })
@@ -477,7 +631,10 @@ onUnmounted(() => {
     </header>
 
     <p v-if="preparingExit" class="alert alert--warning upload__alert">
-      应用正在退出：正在取消上传并清理未完成的分片…
+      应用正在退出：正在暂停上传并保存进度，下次启动可以继续…
+    </p>
+    <p v-else-if="pausing" class="alert alert--warning upload__alert">
+      正在暂停上传，已完成的进度会保留…
     </p>
     <p v-else-if="cancelling" class="alert alert--warning upload__alert">
       正在取消上传并清理未完成的分片，请稍候…
@@ -496,7 +653,9 @@ onUnmounted(() => {
           v-for="task in tasks"
           :key="task.id"
           :task="task"
-          @retry="retryTask"
+          @pause="handleTaskPause"
+          @resume="resumeTask"
+          @cancel="handleTaskCancel"
           @remove="removeTask"
         />
       </ul>
@@ -537,12 +696,22 @@ onUnmounted(() => {
           清除已结束
         </button>
         <button
+          v-if="uploadState.running"
           class="btn btn--small"
           type="button"
-          :disabled="tasks.length === 0 || (!uploadState.running && !canUpload)"
+          :disabled="pausing"
+          @click="handlePause"
+        >
+          暂停
+        </button>
+        <button
+          v-if="uploadState.running || hasDestructible"
+          class="btn btn--danger btn--small"
+          type="button"
+          :disabled="cancelling"
           @click="handleCancel"
         >
-          {{ cancelLabel }}
+          取消上传
         </button>
         <button
           class="btn btn--primary btn--small"
@@ -550,7 +719,7 @@ onUnmounted(() => {
           :disabled="!canUpload"
           @click="handleUpload"
         >
-          {{ uploadState.running ? '上传中…' : 'Upload' }}
+          {{ primaryLabel }}
         </button>
       </div>
     </footer>

@@ -300,7 +300,10 @@ const canStartNewUploadBatch = async (): Promise<boolean> => {
  * 实际却跟着当前批次进了 /A。所以直接拒绝并聚焦已有上传窗口。
  */
 const refuseNewBatchWhileUploading = async (): Promise<void> => {
-  showNotice('已有上传正在进行，请等它结束后再添加新文件', 'warning')
+  showNotice(
+    '上传窗口里还有未处理的任务（正在上传 / 已暂停 / 等待登记元数据），请先继续或取消它们',
+    'warning'
+  )
 
   try {
     // 不带参数：只显示并聚焦，不覆盖已有的目标目录提示。
@@ -636,11 +639,11 @@ const handleToggleShellIntegration = async (): Promise<void> => {
 /**
  * 关闭主窗口 = 退出应用。
  *
- * 这里先 preventDefault，再按需确认：**有上传在跑**时提醒用户会先取消并清理，
- * 避免误点关闭把正在进行的上传打断。
+ * 这里先 preventDefault，再按需确认：**有上传在跑**时提醒用户会先暂停上传。
+ * 退出**不是**取消：multipart 与断点记录都会保留，下次启动可以继续。
  *
- * 真正的退出由 Rust 侧编排：先广播 notes:prepare-exit 让上传窗口请求取消、
- * best-effort abort multipart，等它回报清理完成（或超时）后再 exit。
+ * 真正的退出由 Rust 侧编排：先广播 notes:prepare-exit 让上传窗口暂停上传
+ * 并持久化 checkpoint，等它回报清理完成（或超时）后再 exit。
  * 判断"有没有上传"用的是显式的 UploadActivity 状态，不是窗口可见性。
  */
 const handleCloseRequested = async (event: { preventDefault: () => void }): Promise<void> => {
@@ -659,7 +662,7 @@ const handleCloseRequested = async (event: { preventDefault: () => void }): Prom
 
     try {
       confirmed = await confirmDialog(
-        '有上传正在进行，退出会先取消上传并清理未完成的分片。确定退出吗？',
+        '有上传正在进行，退出会暂停上传并保留已完成的进度，下次启动可以继续。确定退出吗？',
         {
           title: '退出 Notes Desktop',
           kind: 'warning',

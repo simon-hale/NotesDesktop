@@ -10,6 +10,19 @@
  *   completeMultipartUpload(name, uploadId, parts, opt) -> { res, ... }
  *   abortMultipartUpload(name, uploadId, options)
  *   put(name, file, options)
+ *
+ * ⚠️ 关于 `client.cancel()`（**已核对过 6.23.0 源码，不要凭印象使用**）：
+ *   `lib/common/parallel.js` 的 `proto.cancel(abort)` 只做两件事——
+ *     1. `this.options.cancelFlag = true`；
+ *     2. 销毁 `this.multipartUploadStreams`（Node 流式上传才有的流数组）。
+ *   而 `cancelFlag` 只被 `_parallel` / `_parallelNode` / `managed-upload` /
+ *   `multipart-copy` 这些**本项目没有使用**的高层封装读取；
+ *   显式 `uploadPart` 走的是 `request()`，它完全不看 cancelFlag，
+ *   浏览器端也没有任何 XHR abort 通道（`shims/xhr.js` 里的 `req.abort()` 只在
+ *   子进程/Node 语义下有意义）。
+ *   结论：`cancel()` **既不能中断在途的分片请求，也不能让暂停更跟手**，
+ *   传了 `abort` 参数还会顺手发起 AbortMultipartUpload（暂停时绝对不能这么做）。
+ *   因此本项目的暂停是"让至多 3 个在途分片跑到安全边界"，不调用 `cancel()`。
  */
 declare module 'ali-oss' {
   export interface OSSOptions {

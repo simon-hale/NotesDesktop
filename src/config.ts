@@ -38,6 +38,28 @@ export const SETTINGS_STORE_FILE = 'settings.json'
  */
 export const SHELL_INTEGRATION_ENABLED_KEY = 'shellIntegrationEnabled'
 
+// ---- 断点续传 checkpoint（与 auth.json / settings.json 严格分开）----
+
+/**
+ * 上传断点续传记录的持久化文件。
+ *
+ * **绝不能**放进 auth.json：登录信息与传输状态的生命周期完全不同，
+ * 而且 checkpoint 里连一个凭据字段都不允许出现（见 upload-checkpoints.ts 的说明）。
+ */
+export const UPLOAD_CHECKPOINT_STORE_FILE = 'upload-checkpoints.json'
+
+/** checkpoint 存储 key：整个文件只用一个 key，值是 transferId -> 记录 的映射。 */
+export const UPLOAD_CHECKPOINT_STORE_KEY = 'uploadCheckpoints'
+
+/**
+ * checkpoint schema 版本号。
+ *
+ * 读取时版本不匹配的记录一律**丢弃**（而不是猜测字段含义）：
+ * 丢掉一个旧记录只会让那个文件重新上传一遍；错误地解释它则可能
+ * 用一份不完整的 ETag 列表去 Complete，合成出损坏的对象。
+ */
+export const UPLOAD_CHECKPOINT_SCHEMA_VERSION = 1
+
 // ---- OSS 上传参数（与现有 NotesFrontend 的 ossUpload.async.js 保持一致）----
 
 /** 每个分片 5 MiB。 */
@@ -62,10 +84,25 @@ export const OSS_PROGRESS_CAP = 0.99
 export const STS_USAGE_SINGLE_FILE_UPLOAD = 'SINGLE_FILE_UPLOAD'
 
 /**
- * 关闭上传窗口 / 退出应用时，等待"取消上传 + abort multipart + 状态清理"完成的
+ * STS 过期安全余量。
+ *
+ * 距离过期不足这个时间就先刷新凭证，避免"请求发出时还有 3 秒、到达 OSS 时已经过期"
+ * 这种必然失败的边界情况。后端 STS 寿命固定 900 秒，60 秒余量足够宽裕。
+ */
+export const STS_REFRESH_SAFETY_MARGIN_MS = 60 * 1000
+
+/**
+ * 后端没有返回可解析的 `expiration` 时的兜底寿命（毫秒）。
+ * 与后端 STS 的 900 秒一致，宁可提前刷新也不要用过期的凭证发请求。
+ */
+export const STS_FALLBACK_LIFETIME_MS = 900 * 1000
+
+/**
+ * 关闭上传窗口 / 退出应用时，等待"暂停上传 + 持久化 checkpoint + 收尾"完成的
  * 有界上限（毫秒）。必须明显小于 Rust 侧 config::EXIT_CLEANUP_TIMEOUT_MS 的兜底超时。
  *
- * 超时**不代表**上传已经停止：此时界面要保持可见并显示"正在取消"，
- * 后台继续等待真正 idle，绝不能假装已经停下来了。
+ * 超时**不代表**上传已经停止，也**不等于**取消：此时 checkpoint 已经落盘，
+ * 进程带着在途的分片请求退出也是安全的——那个未被记录的服务端分片，
+ * 下次 Resume 时用同一个 partNumber 重传即可（要求 9）。
  */
 export const UPLOAD_CLEANUP_TIMEOUT_MS = 3000

@@ -17,6 +17,7 @@ import {
   API_BASE_URL,
   API_LANGUAGE,
   CONFIG_ERROR_MESSAGE,
+  STS_FALLBACK_LIFETIME_MS,
   STS_USAGE_SINGLE_FILE_UPLOAD
 } from '../config'
 import type {
@@ -392,6 +393,43 @@ export interface UploadTicketRequest {
 }
 
 /**
+ * 解析后端返回的 STS `expiration`，统一成 epoch 毫秒。
+ *
+ * 后端契约给的是**绝对 UTC 过期时间**，但具体形态（ISO-8601 / epoch 秒 / epoch 毫秒）
+ * 在客户端这一侧做兼容解析成本极低，而猜错的代价是"凭证已经过期却以为还早"。
+ * 因此：能解析出任何合理值就接受，完全解析不了才退回 900 秒兜底寿命。
+ *
+ * 过小的值（明显不是本世纪的毫秒时间戳）按秒处理；来路不明的值一律拒绝。
+ */
+export const parseStsExpirationMs = (
+  raw: string | number | undefined | null
+): number => {
+  const now = Date.now()
+
+  if (raw !== undefined && raw !== null) {
+    const numeric = typeof raw === 'number' ? raw : Number(raw)
+
+    if (Number.isFinite(numeric) && numeric > 0) {
+      // epoch 秒（约 1e9）与 epoch 毫秒（约 1e12）用 1e12 分开。
+      const ms = numeric < 1e12 ? numeric * 1000 : numeric
+
+      if (ms > now) return ms
+    }
+
+    if (typeof raw === 'string') {
+      const parsed = Date.parse(raw)
+
+      // ISO-8601 里不带时区的字符串会被 Date.parse 当成**本地时间**，
+      // 那可能是过去，也可能偏早。只在结果确实在未来时才采纳。
+      if (Number.isFinite(parsed) && parsed > now) return parsed
+    }
+  }
+
+  // 无法解析（字段缺失 / 格式不认识）：按后端固定的 900 秒寿命兜底。
+  return now + STS_FALLBACK_LIFETIME_MS
+}
+
+/**
  * 申请 STS。
  *
  * `success` 与 `same_file_name` 都允许继续上传；
@@ -439,6 +477,7 @@ export async function requestUploadTicket(
     accessKeySecret,
     securityToken,
     objectKey,
+    expirationMs: parseStsExpirationMs(response.expiration),
     overwrite: message === 'same_file_name'
   }
 }

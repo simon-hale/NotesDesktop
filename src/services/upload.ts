@@ -1,5 +1,5 @@
 /**
- * 统一的上传服务。
+ * 统一的上传服务（持久化可续传版本）。
  *
  * 首页 Upload 按钮、独立上传窗口、Explorer 右键上传**全部**走这里，
  * 不存在第二套上传实现。
@@ -9,12 +9,29 @@
  *   申请 STS → OSS 上传真正完成 → POST /api/file/insert/ → 才算 100% 成功
  *
  * 关键约束：
- *   - OSS 上传完成前绝不写数据库；
+ *   - OSS 上传完成前绝不写数据库；进度在 insert 成功前永远不超过 99%；
  *   - 文件串行上传，单文件内部最多 3 个 5 MiB 分片并行；
- *   - 每个分片用完立刻释放 Uint8Array / ArrayBuffer / Blob 引用，只保留 { number, etag }；
- *   - 重试只针对失败分片，不重传已成功的分片；
- *   - 严重失败或用户取消：best-effort abortMultipartUpload，abort 失败不覆盖原始错误；
- *   - insert 失败时明确提示"OSS 已上传成功，但文件元数据写入失败"，重试只补写数据库。
+ *   - 每个分片用完立刻释放 Uint8Array / ArrayBuffer / Blob 引用，只保留 { number, etag, size }；
+ *   - 显式 multipart：InitMultipartUpload / UploadPart / CompleteMultipartUpload，
+ *     绝不换成浏览器 `multipartUpload(File)`；
+ *   - **本地 PartNumber + ETag 是唯一事实来源**，完成合并绝不依赖 ListParts；
+ *   - 三个持久化阶段：TRANSFERRING / PAUSED / METADATA_PENDING（见 upload-checkpoints.ts）。
+ *
+ * 暂停 vs 取消（**这是本文件最重要的一组语义**）：
+ *
+ *   Pause（暂停）
+ *     - 停止调度新分片；在途分片跑到安全边界后自然结束（ali-oss 6.23.0 的
+ *       `client.cancel()` 只置 cancelFlag / 销毁 Node stream，**不会**中断浏览器端
+ *       已经发出的 XHR，所以这里不使用它——见下面 pauseUploads 的说明）；
+ *     - 保留 uploadId 与全部已完成分片记录，phase 落盘为 PAUSED；
+ *     - **绝不** AbortMultipartUpload，**绝不**删除 checkpoint。
+ *
+ *   Cancel（取消上传）
+ *     - 破坏性：abort multipart（double abort）→ 删除 checkpoint → 标记取消。
+ *     - 只有显式取消、本地源身份变化、以及明确不可恢复的任务失效才会走这条路。
+ *
+ *   正常退出应用 = 暂停，不是取消：进程带着在途分片退出也是安全的，
+ *   那个"服务端已成功但本地还没记录"的分片，下次 Resume 用同一个 partNumber 重传即可。
  */
 
 import { computed, reactive } from 'vue'
@@ -23,24 +40,50 @@ import {
   OSS_MAX_RETRY,
   OSS_PROGRESS_CAP,
   OSS_RETRY_BASE_DELAY_MS,
-  OSS_TIMEOUT_MS,
   PART_PARALLEL,
   PART_SIZE,
   UPLOAD_CLEANUP_TIMEOUT_MS
 } from '../config'
-import type { Breadcrumb, UploadTask } from '../types'
+import type { Breadcrumb, LocalFileInfo, UploadStatus, UploadTask } from '../types'
 import {
   ApiError,
   buildStringOfPath,
   insertFileRecord,
-  isAuthFailure,
-  requestUploadTicket
+  isAuthFailure
 } from './api'
 import { getAccessToken, getCurrentUsername, onSessionChanged } from './auth'
 import type { SessionChange } from './auth'
 import { readFileChunk, setUploadActive, setUploadBatchBusy, statLocalFile } from './filesystem'
+import {
+  createCheckpoint,
+  deleteCheckpoint,
+  getCheckpoint,
+  listCheckpointsForOwner,
+  loadCheckpoints,
+  checkpointLoadFailed,
+  recordedBytes,
+  resetCheckpointForFreshUpload,
+  saveCheckpoint
+} from './upload-checkpoints'
+import type {
+  UploadCheckpoint,
+  UploadCheckpointPart,
+  UploadCheckpointTarget
+} from './upload-checkpoints'
+import {
+  isOssNoSuchUpload,
+  TransferCredentials,
+  TransferIdentityChangedError,
+  TransferSessionExpiredError
+} from './transfer-credentials'
+import {
+  UploadCanceledError,
+  UploadPausedError,
+  UploadRegistrationError
+} from './upload-errors'
 
-type OssClient = import('ali-oss').default
+export { UploadCanceledError, UploadPausedError, UploadRegistrationError }
+
 type MultipartPart = import('ali-oss').MultipartPart
 
 /** OSS multipart 最多 10000 个分片。 */
@@ -57,33 +100,21 @@ const OSS_MAX_PART_NUMBER = 10000
  */
 const SESSION_EXPIRED_MESSAGE = '登录状态已失效，请重新登录'
 
-/**
- * 上传被用户取消。
- */
-export class UploadCanceledError extends Error {
-  constructor() {
-    super('上传已取消')
-    this.name = 'UploadCanceledError'
-  }
-}
+/** Rust 侧本地文件被改动时返回的错误文本前缀（与 commands/files.rs 一致）。 */
+const LOCAL_FILE_CHANGED_MARKER = 'The local file changed during upload'
 
-/**
- * 无法把"上传活动状态"登记到 Rust 侧。
- *
- * 这个状态是退出逻辑的依据，属于关机正确性的一部分，因此**登记失败就不允许开始上传**，
- * 否则应用可能在有上传在跑时直接退出。
- */
-export class UploadRegistrationError extends Error {
-  constructor(cause?: unknown) {
-    const detail = cause instanceof Error ? cause.message : String(cause ?? '未知原因')
-    super(`无法登记上传状态，已取消本次上传：${detail}`)
-    this.name = 'UploadRegistrationError'
-  }
-}
+/** 可以被"继续上传"接手的任务状态。 */
+const RESUMABLE_STATUSES: ReadonlySet<UploadStatus> = new Set<UploadStatus>([
+  'pending',
+  'paused',
+  'error',
+  'canceled',
+  'metadata_pending'
+])
 
 export interface UploadState {
   tasks: UploadTask[]
-  /** 当前目标云目录（面包屑），string_of_path 由它推导。 */
+  /** 当前目标云目录（面包屑），string_of_path 由它推导；**只影响新任务**。 */
   target: Breadcrumb[]
   running: boolean
 }
@@ -113,31 +144,78 @@ function clamp01(value: number): number {
   return Math.min(1, Math.max(0, value))
 }
 
-let taskSequence = 0
-let runController: AbortController | null = null
+/**
+ * 当前活动传输。
+ *
+ * `checkpoint` 是**内存里的权威副本**（与 upload-checkpoints.ts 的缓存是同一个对象），
+ * 3 个 worker 直接把新分片写进它的 parts，然后统一走串行落盘。
+ */
+interface ActiveTransfer {
+  task: UploadTask
+  checkpoint: UploadCheckpoint
+  credentials: TransferCredentials
+  /** 本次传输的暂停请求（graceful）。 */
+  pauseRequested: boolean
+}
+
+/** 一轮上传（一批文件串行处理）的运行时上下文。 */
+interface ActiveRun {
+  /** 破坏性取消信号；**只有显式取消才会 abort**。 */
+  controller: AbortController
+  /** 本轮是否被要求暂停（暂停不 abort）。 */
+  pauseRequested: boolean
+  transfer: ActiveTransfer | null
+}
+
+let activeRun: ActiveRun | null = null
 let runningPromise: Promise<void> | null = null
 
 /**
  * 当前进行中的 multipart。
  *
- * 保留 OSS client 是为了让 `cancelUpload()` 能**立刻**发起一次 best-effort abort，
- * 而不必等当前分片请求返回。
+ * 保留它是为了让"显式取消"能**立刻**发起一次 best-effort abort，
+ * 而不必等当前分片请求返回（在途 HTTP 请求无法强制中断）。
  */
 interface ActiveMultipart {
-  client: OssClient
+  credentials: TransferCredentials
   objectKey: string
   uploadId: string
 }
 
 let activeMultipart: ActiveMultipart | null = null
 
-const nextTaskId = (): string => {
-  taskSequence += 1
-  return `upload-${taskSequence}`
+/** 生成稳定的 transferId（同时就是 UploadTask.id 与 checkpoint 主键）。 */
+const createTransferId = (): string => {
+  const globalCrypto = globalThis.crypto
+
+  if (globalCrypto && typeof globalCrypto.randomUUID === 'function') {
+    return globalCrypto.randomUUID()
+  }
+
+  if (globalCrypto && typeof globalCrypto.getRandomValues === 'function') {
+    const bytes = new Uint8Array(16)
+
+    globalCrypto.getRandomValues(bytes)
+
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+  }
+
+  return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}`
 }
 
 const throwIfAborted = (signal: AbortSignal): void => {
   if (signal.aborted) throw new UploadCanceledError()
+}
+
+/**
+ * 在"取消 / 暂停"边界上做检查。
+ *
+ * 取消优先于暂停：一旦 abort，就绝不能再走温和的暂停路径。
+ */
+const throwIfStopped = (run: ActiveRun): void => {
+  throwIfAborted(run.controller.signal)
+
+  if (run.pauseRequested) throw new UploadPausedError()
 }
 
 /**
@@ -191,18 +269,34 @@ interface OssLikeError {
   response?: { status?: number }
 }
 
+/** Rust 命令以字符串形式 reject："本地文件在上传期间被改动"。 */
+const isLocalFileChangedError = (error: unknown): boolean => {
+  if (typeof error === 'string') return error.includes(LOCAL_FILE_CHANGED_MARKER)
+  if (error instanceof Error) return error.message.includes(LOCAL_FILE_CHANGED_MARKER)
+
+  return false
+}
+
 /**
  * 可重试错误：
  *   网络错误 / timeout / connection|socket|ECONNRESET|RequestError /
  *   无 HTTP status / HTTP 408 / HTTP 429 / HTTP >= 500
  *
  * **认证失败（HTTP 401 / 403）永远不重试**：它们不在上面的集合里，所以
- * 无论是后端接口返回的 `ApiError`，还是 OSS 因凭证失效返回的 403，
- * 都会被判为不可重试（tokenVersion 失效、STS 过期都属于这一类）。
+ * 无论是后端接口返回的 `ApiError`，还是 OSS 因凭证彻底失效返回的 403，
+ * 都会被判为不可重试（tokenVersion 失效、STS 过期（已由凭证管理器兜住）都属于这一类）。
  * 业务错误同样不重试。
+ *
+ * 本地文件改动、目标身份变化、暂停、取消这几类**本地错误**必须显式排除：
+ * 它们是 Error 实例但没有 status 字段，若落到"没有 HTTP status 就重试"的兜底分支，
+ * 就会变成一个毫无意义的死循环。
  */
 const isRetryableError = (error: unknown): boolean => {
   if (error instanceof UploadCanceledError) return false
+  if (error instanceof UploadPausedError) return false
+  if (error instanceof TransferIdentityChangedError) return false
+  if (error instanceof TransferSessionExpiredError) return false
+  if (isLocalFileChangedError(error)) return false
   if (isAuthFailure(error)) return false
 
   if (error instanceof ApiError) {
@@ -248,46 +342,61 @@ const describeError = (error: unknown): string => {
   }
 }
 
-/** best-effort 清理：abort 自身失败不能覆盖原始错误。 */
+/**
+ * best-effort 清理：abort 自身失败不能覆盖原始错误。
+ *
+ * 走 `credentials.run` 是为了让"凭证刚好过期"也能被一次静默刷新兜住：
+ * 取消上传时因为 403 而 abort 失败，会留下一个真正的孤儿 multipart。
+ */
 const abortMultipartSafely = async (
-  client: OssClient,
+  credentials: TransferCredentials,
   objectKey: string,
   uploadId: string
 ): Promise<void> => {
+  if (!uploadId || !objectKey) return
+
   try {
-    await client.abortMultipartUpload(objectKey, uploadId)
-  } catch {
-    // 忽略：清理失败不影响调用方拿到的真实错误。
+    await credentials.run((client) => client.abortMultipartUpload(objectKey, uploadId))
+  } catch (error) {
+    // 404 / NoSuchUpload 表示"目标已达成"：multipart 已经不存在了。
+    if (isOssNoSuchUpload(error)) return
+
+    // 其它失败一律静默：清理失败不影响调用方拿到的真实错误。
   }
 }
 
-const createOssClient = async (ticket: {
-  region: string
-  bucket: string
-  accessKeyId: string
-  accessKeySecret: string
-  securityToken: string
-}): Promise<OssClient> => {
-  // 按需加载，避免主页 bundle 里塞进整个 OSS SDK。
-  const { default: OSS } = await import('ali-oss')
+/** 对当前进行中的 multipart 发起一次 best-effort abort（失败静默）。 */
+const abortActiveMultipartNow = async (): Promise<void> => {
+  const multipart = activeMultipart
 
-  return new OSS({
-    region: ticket.region,
-    bucket: ticket.bucket,
-    accessKeyId: ticket.accessKeyId,
-    accessKeySecret: ticket.accessKeySecret,
-    stsToken: ticket.securityToken,
-    secure: true,
-    timeout: OSS_TIMEOUT_MS
-  })
+  if (!multipart) return
+
+  await abortMultipartSafely(multipart.credentials, multipart.objectKey, multipart.uploadId)
 }
 
+/** 删除 checkpoint（失败重试一次；仍失败也不能影响主流程的成功判定）。 */
+const deleteCheckpointSafely = async (transferId: string): Promise<void> => {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await deleteCheckpoint(transferId)
+      return
+    } catch {
+      // 再试一次；仍失败就交给下次启动时的整体覆盖写。
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 分片上传
+// ---------------------------------------------------------------------------
+
 interface PartUploadOptions {
-  client: OssClient
+  credentials: TransferCredentials
   objectKey: string
   uploadId: string
   partNo: number
   localPath: string
+  expected: { size: number; modifiedAtMs: number }
   offset: number
   length: number
   signal: AbortSignal
@@ -296,31 +405,41 @@ interface PartUploadOptions {
 /**
  * 上传单个分片，失败时按策略只重试这一个分片。
  *
- * 每个分片：Rust read_file_chunk → ArrayBuffer → Blob → client.uploadPart，
- * 返回后立即释放这些二进制引用，只把 { number, etag } 交给调用方。
+ * 每个分片：Rust read_file_chunk（带源快照校验）→ ArrayBuffer → Blob → uploadPart，
+ * 返回后立即释放这些二进制引用，只把 { number, etag, size } 交给调用方。
+ *
+ * "本地文件改动"是**不可重试**的：重试同一个 offset 只会拿到同样的错误，
+ * 而且继续用旧快照上传会拼出一个前后不一致的对象。
  */
 async function uploadPartWithRetry(
   options: PartUploadOptions
 ): Promise<MultipartPart> {
-  const { client, objectKey, uploadId, partNo, localPath, offset, length, signal } =
-    options
+  const {
+    credentials,
+    objectKey,
+    uploadId,
+    partNo,
+    localPath,
+    expected,
+    offset,
+    length,
+    signal
+  } = options
 
   for (let attempt = 0; ; attempt += 1) {
     throwIfAborted(signal)
 
     try {
-      const buffer = await readFileChunk(localPath, offset, length)
+      const buffer = await readFileChunk(localPath, offset, length, expected)
       const blob = new Blob([buffer])
 
       // ali-oss 6.23.0 的浏览器实现要求 Blob/File：
       // 内部执行 file.slice(start, end)，所以单分片用 start=0、end=blob.size。
-      const result = await client.uploadPart(
-        objectKey,
-        uploadId,
-        partNo,
-        blob,
-        0,
-        blob.size
+      //
+      // 通过 credentials.run 发出：凭证接近过期会先静默刷新，
+      // 收到 403/401 会强制刷新一次并重试这同一个分片（uploadPart 幂等）。
+      const result = await credentials.run((client) =>
+        client.uploadPart(objectKey, uploadId, partNo, blob, 0, blob.size)
       )
 
       // 返回对象是 { name, etag, res }，etag 来自 result.res.headers.etag。
@@ -344,7 +463,7 @@ async function uploadPartWithRetry(
 
 /** 空文件：直接 put 一个空 Blob，成功后再写数据库。 */
 async function putEmptyObject(
-  client: OssClient,
+  credentials: TransferCredentials,
   objectKey: string,
   signal: AbortSignal
 ): Promise<void> {
@@ -352,7 +471,7 @@ async function putEmptyObject(
     throwIfAborted(signal)
 
     try {
-      await client.put(objectKey, new Blob([]))
+      await credentials.run((client) => client.put(objectKey, new Blob([])))
       return
     } catch (error) {
       if (attempt >= OSS_MAX_RETRY || !isRetryableError(error)) {
@@ -365,19 +484,48 @@ async function putEmptyObject(
 }
 
 interface MultipartOptions {
-  client: OssClient
+  credentials: TransferCredentials
   objectKey: string
+  uploadId: string
   localPath: string
+  expected: { size: number; modifiedAtMs: number }
   size: number
-  signal: AbortSignal
+  /** 使用 checkpoint 里记下的分片大小：中途改过 PART_SIZE 也能正确续传。 */
+  partSize: number
+  /** 本地已记录的分片（**权威**）。worker 直接往里写。 */
+  completed: Map<number, UploadCheckpointPart>
+  /** 每个分片成功后调用：落盘 checkpoint（串行化）。 */
+  onPartUploaded: (part: UploadCheckpointPart) => Promise<void>
   onBytes: (uploadedBytes: number) => void
+  isPauseRequested: () => boolean
+  signal: AbortSignal
 }
 
-/** 显式 multipart：init → 分片并发上传（最多 3 个 worker）→ 按 number 升序 complete。 */
-async function uploadMultipart(options: MultipartOptions): Promise<void> {
-  const { client, objectKey, localPath, size, signal, onBytes } = options
+/**
+ * 显式 multipart：init 由调用方负责 → 分片并发上传（最多 3 个 worker）→ 本地 ETag 升序 complete。
+ *
+ * 返回值 `paused: true` 表示"因为暂停而停在安全边界"，**没有**执行 Complete，
+ * 且 multipart 与本地分片记录都完整保留。
+ */
+async function uploadMultipart(
+  options: MultipartOptions
+): Promise<{ paused: boolean }> {
+  const {
+    credentials,
+    objectKey,
+    uploadId,
+    localPath,
+    expected,
+    size,
+    partSize,
+    completed,
+    onPartUploaded,
+    onBytes,
+    isPauseRequested,
+    signal
+  } = options
 
-  const totalParts = Math.ceil(size / PART_SIZE)
+  const totalParts = Math.ceil(size / partSize)
 
   if (totalParts > OSS_MAX_PART_NUMBER) {
     throw new Error(`文件过大：分片数 ${totalParts} 超过 OSS 上限 ${OSS_MAX_PART_NUMBER}`)
@@ -385,119 +533,151 @@ async function uploadMultipart(options: MultipartOptions): Promise<void> {
 
   throwIfAborted(signal)
 
-  const init = await client.initMultipartUpload(objectKey)
-  const uploadId = init?.uploadId
+  // 恢复时先把"已经记录过的分片"计入进度，用户一按继续就能看到真实起点。
+  let uploadedBytes = 0
 
-  if (!uploadId) {
-    throw new Error('OSS 未返回 uploadId')
+  for (const part of completed.values()) {
+    uploadedBytes += part.size
   }
 
-  activeMultipart = { client, objectKey, uploadId }
+  onBytes(uploadedBytes)
 
-  // 在 try 之外声明，便于失败路径等待所有 worker 退出后再收尾。
+  if (isPauseRequested()) return { paused: true }
+
   const workers: Array<Promise<void>> = []
 
-  try {
-    // 只保存 { number, etag }，不保存任何分片内容。
-    const parts: Array<MultipartPart | undefined> = new Array(totalParts)
+  /**
+   * 共享的"停止领取新分片"标记。
+   *
+   * `Promise.all` 在一个 worker 抛错后会立刻 reject，但其它 worker 并不会因此停下：
+   * 它们会在当前的 part 成功后继续 `nextIndex++` 领取下一个分片。
+   * 在第一次 abort 真正生效之前，那等于白传。
+   *
+   * 所以任一 worker 最终失败时先置位，其它 worker 完成在途 part 后即退出。
+   */
+  let stopScheduling = false
+  let nextIndex = 0
 
-    // 递增计数器：每完成一个分片累加一次，避免每次重扫整个分片数组。
-    let uploadedBytes = 0
-    let nextIndex = 0
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      throwIfAborted(signal)
 
-    /**
-     * 共享的"停止领取新分片"标记。
-     *
-     * `Promise.all` 在一个 worker 抛错后会立刻 reject，但其它 worker 并不会因此停下：
-     * 它们会在当前的 part 成功后继续 `nextIndex++` 领取下一个分片。
-     * 在第一次 abort 真正生效之前，那等于白传。
-     *
-     * 所以任一 worker 最终失败时先置位，其它 worker 完成在途 part 后即退出，
-     * 不再领取新分片（不改变既有的 abort / allSettled / 二次 abort 结构）。
-     */
-    let stopScheduling = false
+      if (stopScheduling) return
+      if (isPauseRequested()) return
 
-    const worker = async (): Promise<void> => {
-      for (;;) {
-        throwIfAborted(signal)
+      const index = nextIndex
+      nextIndex += 1
 
-        if (stopScheduling) return
+      if (index >= totalParts) return
 
-        const index = nextIndex
-        nextIndex += 1
+      const partNo = index + 1
+      const offset = index * partSize
+      const length = Math.min(partSize, size - offset)
 
-        if (index >= totalParts) return
+      /**
+       * 本地已经记录过这个分片号：**不发网络请求**，直接跳过。
+       *
+       * 这正是"Resume 不重传已成功分片"的实现点；同时也是崩溃恢复的兜底——
+       * 如果崩溃发生在"OSS 已接受分片"与"本地记下 ETag"之间，
+       * 那么这里不会跳过它，而是用同一个 partNumber 重传一次（安全且幂等）。
+       */
+      if (completed.has(partNo)) continue
 
-        const offset = index * PART_SIZE
-        const length = Math.min(PART_SIZE, size - offset)
+      let part: MultipartPart
 
-        let part: MultipartPart
-
-        try {
-          part = await uploadPartWithRetry({
-            client,
-            objectKey,
-            uploadId,
-            partNo: index + 1,
-            localPath,
-            offset,
-            length,
-            signal
-          })
-        } catch (error) {
-          // 这个 worker 最终失败了：通知其它 worker 不要再领新分片。
-          stopScheduling = true
-          throw error
-        }
-
-        parts[index] = part
-        uploadedBytes += length
-        onBytes(uploadedBytes)
+      try {
+        part = await uploadPartWithRetry({
+          credentials,
+          objectKey,
+          uploadId,
+          partNo,
+          localPath,
+          expected,
+          offset,
+          length,
+          signal
+        })
+      } catch (error) {
+        // 这个 worker 最终失败了：通知其它 worker 不要再领新分片。
+        stopScheduling = true
+        throw error
       }
+
+      // ① 更新内存里的权威分片表；② 落盘（串行化，见 upload-checkpoints.ts）。
+      //    顺序不能反：先落盘再记录，会让内存与磁盘短暂不一致。
+      const record: UploadCheckpointPart = {
+        partNumber: partNo,
+        etag: part.etag,
+        size: length
+      }
+
+      completed.set(partNo, record)
+      await onPartUploaded(record)
+
+      uploadedBytes += length
+      onBytes(uploadedBytes)
     }
+  }
 
-    const workerCount = Math.min(PART_PARALLEL, totalParts)
+  const workerCount = Math.min(PART_PARALLEL, totalParts)
 
+  try {
     for (let index = 0; index < workerCount; index += 1) {
       workers.push(worker())
     }
 
     await Promise.all(workers)
-
-    const completed = parts.filter(
-      (part): part is MultipartPart => part !== undefined
-    )
-
-    if (completed.length !== totalParts) {
-      throw new Error('分片数量不完整，已放弃合并')
-    }
-
-    // completeMultipartUpload 内部也会排序，这里显式升序以保证语义清晰。
-    completed.sort((left, right) => left.number - right.number)
-
-    throwIfAborted(signal)
-
-    await client.completeMultipartUpload(objectKey, uploadId, completed)
   } catch (error) {
-    // 严重失败或取消：先尽力 abort（尽早发出清理请求；
-    // 已发出的 HTTP 分片请求并不会因此立即终止，只能等它返回或超时），
-    // 再等所有 worker 退出。
-    await abortMultipartSafely(client, objectKey, uploadId)
-
-    // ② 等所有 worker 真正退出，保证没有游离的分片上传任务残留。
-    await Promise.allSettled(workers)
-
-    // ③ 收尾再 abort 一次：清掉"第一次 abort 之后才完成"的分片。
-    //    纯属清理优化，失败同样不能覆盖原始错误。
-    await abortMultipartSafely(client, objectKey, uploadId)
+    if (error instanceof UploadCanceledError) {
+      // 显式取消：破坏性清理。
+      //   ① 尽早发出 abort（已发出的 HTTP 分片请求不会因此立即终止，只能等它返回或超时）；
+      //   ② 等所有 worker 真正退出；
+      //   ③ 再 abort 一次，清掉"第一次 abort 之后才完成"的分片。
+      await abortMultipartSafely(credentials, objectKey, uploadId)
+      await Promise.allSettled(workers)
+      await abortMultipartSafely(credentials, objectKey, uploadId)
+    } else {
+      // 可恢复失败 / 暂停：**保留 multipart 与本地分片记录**，只等 worker 退出。
+      // 网络中断、超时、5xx、重试预算耗尽都走这里；下次 Resume 从断点继续。
+      await Promise.allSettled(workers)
+    }
 
     throw error
-  } finally {
-    if (activeMultipart?.uploadId === uploadId) {
-      activeMultipart = null
-    }
   }
+
+  // 暂停请求优先于 Complete：用户按了暂停就停在断点，绝不偷偷把剩下两步做完。
+  if (isPauseRequested()) return { paused: true }
+
+  // 严格使用**本地记录**的 partNumber + ETag，按 partNumber 升序。
+  const parts = [...completed.values()].sort(
+    (left, right) => left.partNumber - right.partNumber
+  )
+
+  if (parts.length !== totalParts) {
+    throw new Error('分片数量不完整，已放弃合并')
+  }
+
+  const totalBytes = parts.reduce((sum, part) => sum + part.size, 0)
+
+  if (totalBytes !== size) {
+    throw new Error('分片大小与本地文件不一致，已放弃合并')
+  }
+
+  const finalParts: MultipartPart[] = parts.map((part) => ({
+    number: part.partNumber,
+    etag: part.etag
+  }))
+
+  await credentials.run((client) =>
+    client.completeMultipartUpload(objectKey, uploadId, finalParts)
+  )
+
+  return { paused: false }
 }
+
+// ---------------------------------------------------------------------------
+// 进度
+// ---------------------------------------------------------------------------
 
 /** 更新任务进度，OSS 阶段最多 OSS_PROGRESS_CAP。 */
 const setOssProgress = (task: UploadTask, uploadedBytes: number): void => {
@@ -509,30 +689,59 @@ const setOssProgress = (task: UploadTask, uploadedBytes: number): void => {
   task.progress = Math.min(OSS_PROGRESS_CAP, clamp01(uploadedBytes / task.size))
 }
 
+/** 根据 checkpoint 推算进度（恢复 / 暂停时使用）。 */
+const progressFromCheckpoint = (
+  checkpoint: UploadCheckpoint,
+  size: number
+): number => {
+  if (checkpoint.phase === 'METADATA_PENDING') return OSS_PROGRESS_CAP
+
+  if (size <= 0) {
+    // 空文件没有分片：只要已经 init 过就说明对象已经写好了。
+    return checkpoint.uploadId ? OSS_PROGRESS_CAP : 0
+  }
+
+  return Math.min(OSS_PROGRESS_CAP, clamp01(recordedBytes(checkpoint) / size))
+}
+
+// ---------------------------------------------------------------------------
+// 元数据（数据库）落库
+// ---------------------------------------------------------------------------
+
 /**
  * 只补写数据库元数据。
  *
  * 前提：OSS 对象**已经完整上传成功**（task.objectUploaded === true），
  * 这里只调用 `/api/file/insert/`，不 stat 本地文件、不看当前 UI 目标目录。
- * 使用的路径 / 父目录 / 文件名全部来自上传成功时保存下来的快照。
+ * 使用的路径 / 父目录 / 文件名全部来自任务开始时冻结的目标快照，
+ * 因此**原始本地文件被删除或移动也照样能补写成功**。
  */
 async function insertMetadataOnly(
   task: UploadTask,
   token: string,
   signal: AbortSignal
 ): Promise<void> {
+  // 进度停在 99%，标签固定为"正在登记文件信息…"：这一步永远不重传对象。
+  task.status = 'metadata_pending'
+  task.progress = OSS_PROGRESS_CAP
+  task.message = '正在登记文件信息…'
+
   try {
     await insertFileRecord({
       token,
-      stringOfPath: task.uploadedPath,
-      filename: task.uploadedFilename || task.name,
-      parentId: task.uploadedParentId,
+      stringOfPath: task.targetStringOfPath,
+      filename: task.targetFilename || task.name,
+      parentId: task.targetParentId,
       signal
     })
 
     task.progress = 1
     task.status = 'success'
-    task.message = '文件元数据已补写成功'
+    task.message = task.overwrite ? '已覆盖同名文件' : ''
+
+    // 元数据已落库：checkpoint 的使命结束。删不掉也不影响本次成功，
+    // 但下次启动会把这条记录当成待补写再 insert 一次，所以要重试一次。
+    await deleteCheckpointSafely(task.id)
   } catch (error) {
     if (error instanceof UploadCanceledError) {
       task.status = 'canceled'
@@ -541,32 +750,481 @@ async function insertMetadataOnly(
       return
     }
 
-    task.status = 'error'
+    // OSS 已经成功，只是元数据没写进去：保持 METADATA_PENDING，
+    // 进度停在 99%，重试只补写数据库、绝不重传对象。
+    task.status = 'metadata_pending'
+    task.objectUploaded = true
     task.progress = OSS_PROGRESS_CAP
 
     // 登录态失效（401/403，例如后端 tokenVersion 被提升）：
-    // 明确告知会话过期，同时**保留 99% 的恢复状态**——OSS 对象已经完整上传，
-    // 重新登录后点重试只会补写元数据，不会重传文件。
-    if (isAuthFailure(error)) {
+    // 明确告知会话过期，同时保留 99% 的恢复状态——重新登录后点重试只会补写元数据。
+    if (isAuthFailure(error) || error instanceof TransferSessionExpiredError) {
       task.message = `${SESSION_EXPIRED_MESSAGE}；OSS 已上传，登录后重试只会补写元数据`
       return
     }
 
-    // OSS 已经成功，只是元数据没写进去：不要偷偷重传整个文件。
     task.message = `OSS 已上传成功，但文件元数据写入失败：${describeError(error)}`
   }
 }
 
-async function runTask(task: UploadTask, signal: AbortSignal): Promise<void> {
-  task.status = 'uploading'
-  task.message = ''
-  task.overwrite = false
+// ---------------------------------------------------------------------------
+// checkpoint 辅助
+// ---------------------------------------------------------------------------
+
+/** 本地源身份是否与 checkpoint 记录的完全一致（路径 + 大小 + mtime）。 */
+const sourceMatches = (
+  source: UploadCheckpoint['source'],
+  info: LocalFileInfo
+): boolean =>
+  source.path === info.path &&
+  source.size === info.size &&
+  // mtime 为 0 表示文件系统不提供：此时只比对路径与大小。
+  (source.modifiedAtMs === 0 || info.modifiedAtMs === 0
+    ? true
+    : source.modifiedAtMs === info.modifiedAtMs)
+
+/**
+ * 把 checkpoint 落成 PAUSED。
+ *
+ * 没有 uploadId（还没 init）时不需要落盘：远端不存在任何需要保护的状态，
+ * 内存里那条记录本来也还没进缓存。
+ */
+async function persistPaused(transfer: ActiveTransfer): Promise<void> {
+  const { checkpoint } = transfer
+
+  if (checkpoint.phase === 'METADATA_PENDING') return
+  if (!checkpoint.uploadId) return
+
+  checkpoint.phase = 'PAUSED'
+
+  try {
+    await saveCheckpoint(checkpoint)
+  } catch {
+    // 落盘失败不阻塞暂停本身：内存里的分片记录仍然完整，
+    // 真正危险的是"进程已经退出 + 磁盘上没有记录"，那只会导致下次重传。
+  }
+}
+
+/**
+ * 本地源身份已经变化：**不能**把新旧内容拼在一起。
+ *
+ * 处理方式（要求 5）：
+ *   ① 用**新申请**的凭证 best-effort abort 旧的 multipart；
+ *   ② 删除旧 checkpoint；
+ *   ③ 把任务标成"需要重新上传"，绝不假装新文件就是原来那个。
+ */
+async function discardStaleCheckpoint(
+  task: UploadTask,
+  checkpoint: UploadCheckpoint,
+  detail: string
+): Promise<void> {
+  if (checkpoint.uploadId && checkpoint.objectKey) {
+    const controller = new AbortController()
+
+    try {
+      const credentials = new TransferCredentials({
+        identity: checkpoint.target,
+        expectedObjectKey: checkpoint.objectKey,
+        getToken: getAccessToken,
+        signal: controller.signal
+      })
+
+      await abortMultipartSafely(credentials, checkpoint.objectKey, checkpoint.uploadId)
+    } catch {
+      // best-effort：abort 失败也只是留下一个由生命周期规则清理的孤儿分片。
+    }
+  }
+
+  await deleteCheckpointSafely(checkpoint.transferId)
+
+  task.objectUploaded = false
+  task.progress = 0
+  task.status = 'error'
+  task.message = `${detail}；旧的分片上传已丢弃，请重新上传`
+}
+
+// ---------------------------------------------------------------------------
+// runTask
+// ---------------------------------------------------------------------------
+
+/** 冻结目标快照：只在这里读一次 `uploadState.target`，之后全程使用这份副本。 */
+const freezeTarget = (): UploadCheckpointTarget | null => {
+  const breadcrumbs = uploadState.target
+  const parentId = breadcrumbs.length > 0 ? breadcrumbs[breadcrumbs.length - 1]?.id : undefined
+
+  if (!parentId) return null
+
+  return {
+    parentId,
+    stringOfPath: buildStringOfPath(breadcrumbs),
+    filename: ''
+  }
+}
+
+interface PreparedTransfer {
+  checkpoint: UploadCheckpoint
+  credentials: TransferCredentials
+}
+
+/**
+ * 准备一次传输：恢复旧 checkpoint 或新建一条，并校验本地源身份。
+ *
+ * 返回 null 表示"已经在 task 上写好了可展示的状态，调用方直接结束"。
+ */
+async function prepareTransfer(
+  task: UploadTask,
+  run: ActiveRun
+): Promise<PreparedTransfer | null> {
+  const existing = getCheckpoint(task.id)
+
+  if (existing) {
+    // ---- 恢复：先校验本地源身份（要求 5）
+    let info: LocalFileInfo
+
+    try {
+      info = await statLocalFile(existing.source.path)
+    } catch (error) {
+      // 文件被删除 / 移动 / 暂时不可读：**保留** checkpoint（非破坏性）。
+      // 用户可以恢复文件后继续，或者显式取消（那才会 abort multipart）。
+      task.status = 'error'
+      task.progress = progressFromCheckpoint(existing, existing.source.size)
+      task.message = `无法读取本地文件，暂时无法继续：${describeError(error)}`
+      return null
+    }
+
+    if (!sourceMatches(existing.source, info)) {
+      await discardStaleCheckpoint(
+        task,
+        existing,
+        '本地文件已改动（路径 / 大小 / 修改时间与上传时不一致）'
+      )
+      return null
+    }
+
+    if (existing.ownerUsername !== task.ownerUsername) {
+      // 理论上不会发生：checkpoint 是按 ownerUsername 过滤后才恢复的。
+      task.status = 'error'
+      task.message = '这条续传记录属于其它账号，已跳过'
+      return null
+    }
+
+    task.path = info.path
+    task.name = existing.source.filename
+    task.size = info.size
+    task.modifiedAtMs = info.modifiedAtMs
+
+    const credentials = new TransferCredentials({
+      identity: existing.target,
+      expectedObjectKey: existing.objectKey,
+      getToken: getAccessToken,
+      signal: run.controller.signal
+    })
+
+    return { checkpoint: existing, credentials }
+  }
+
+  // ---- 全新传输：在这里冻结目标快照（要求 7）
+  const target = freezeTarget()
+
+  if (!target) {
+    task.status = 'error'
+    task.message = '未选择目标云目录'
+    return null
+  }
+
+  const info = await statLocalFile(task.path)
+
+  throwIfStopped(run)
+
+  task.name = info.name
+  task.size = info.size
+  task.path = info.path
+  task.modifiedAtMs = info.modifiedAtMs
+
+  target.filename = info.name
+
+  return {
+    checkpoint: createCheckpoint({
+      transferId: task.id,
+      ownerUsername: task.ownerUsername,
+      source: {
+        path: info.path,
+        filename: info.name,
+        size: info.size,
+        modifiedAtMs: info.modifiedAtMs
+      },
+      target
+    }),
+    credentials: new TransferCredentials({
+      identity: target,
+      expectedObjectKey: '',
+      getToken: getAccessToken,
+      signal: run.controller.signal
+    })
+  }
+}
+
+/**
+ * 执行一次传输：init（如需要）→ 分片 → Complete。
+ *
+ * 可以被调用两次：第一次遇到 NoSuchUpload 时，调用方会先把 checkpoint 重置成
+ * 全新上传（丢掉旧 uploadId 与旧分片表），再用同一个 transfer 重新执行一次。
+ */
+async function executeTransfer(
+  task: UploadTask,
+  run: ActiveRun,
+  transfer: ActiveTransfer
+): Promise<void> {
+  const { checkpoint, credentials } = transfer
+  const signal = run.controller.signal
+
+  // ① 首次（或刷新后）凭证：同目录同名覆盖提示**只在这里出现一次**，
+  //    后续 STS 静默刷新不会重复弹这条提示。
+  await credentials.ready()
+
+  if (!checkpoint.objectKey) {
+    checkpoint.objectKey = credentials.objectKey
+  }
+
+  if (checkpoint.partSize <= 0) {
+    checkpoint.partSize = PART_SIZE
+  }
+
+  const ticket = credentials.currentTicket
+
+  if (ticket?.overwrite && !checkpoint.overwrite) {
+    checkpoint.overwrite = true
+    task.overwrite = true
+    task.message = '目标目录已有同名文件，将覆盖'
+  } else if (checkpoint.overwrite) {
+    task.overwrite = true
+    task.message = '目标目录已有同名文件，将覆盖'
+  }
+
+  throwIfStopped(run)
+
+  if (task.size === 0) {
+    // 空文件没有可拆分的数据，直接 put 一个空 Blob。
+    await putEmptyObject(credentials, checkpoint.objectKey, signal)
+    task.progress = OSS_PROGRESS_CAP
+    await finishTransfer(task, transfer, run)
+    return
+  }
+
+  // ② 没有 uploadId 才 init；续传**一定**复用保存下来的 uploadId。
+  if (!checkpoint.uploadId) {
+    const init = await credentials.run((client) =>
+      client.initMultipartUpload(checkpoint.objectKey)
+    )
+
+    const uploadId = init?.uploadId
+
+    if (!uploadId) {
+      throw new Error('OSS 未返回 uploadId')
+    }
+
+    checkpoint.uploadId = uploadId
+  }
+
+  // ③ 要求 4：拿到 uploadId 之后、调度分片**之前**立刻落盘。
+  //    这样即使进程在下一刻被杀，下一次启动也能认出这个远端 multipart。
+  checkpoint.phase = 'TRANSFERRING'
+  await saveCheckpoint(checkpoint)
+
+  activeMultipart = {
+    credentials,
+    objectKey: checkpoint.objectKey,
+    uploadId: checkpoint.uploadId
+  }
+
+  const outcome = await uploadMultipart({
+    credentials,
+    objectKey: checkpoint.objectKey,
+    uploadId: checkpoint.uploadId,
+    localPath: task.path,
+    expected: { size: task.size, modifiedAtMs: task.modifiedAtMs },
+    size: task.size,
+    partSize: checkpoint.partSize,
+    completed: checkpoint.parts,
+    onPartUploaded: async () => {
+      // parts 已经就地更新；这里只负责把它串行落盘。
+      //
+      // 刻意**不碰 phase**：暂停可能在分片还在途时就已经把 PAUSED 落盘了，
+      // 晚到的分片记录只应该追加数据，绝不该把阶段改回 TRANSFERRING。
+      await saveCheckpoint(checkpoint)
+    },
+    onBytes: (uploadedBytes) => setOssProgress(task, uploadedBytes),
+    isPauseRequested: () => transfer.pauseRequested || run.pauseRequested,
+    signal
+  })
+
+  activeMultipart = null
+
+  if (outcome.paused) {
+    checkpoint.phase = 'PAUSED'
+    await persistPaused(transfer)
+
+    task.status = 'paused'
+    task.progress = progressFromCheckpoint(checkpoint, task.size)
+    task.message = `已暂停，可继续（已完成的 ${checkpoint.parts.size} 个分片不会重传）`
+    return
+  }
+
+  task.progress = OSS_PROGRESS_CAP
+
+  await finishTransfer(task, transfer, run)
+}
+
+/** Complete 已经成功：先落盘 METADATA_PENDING，再写数据库。 */
+async function finishTransfer(
+  task: UploadTask,
+  transfer: ActiveTransfer,
+  run: ActiveRun
+): Promise<void> {
+  const { checkpoint } = transfer
+
+  task.objectUploaded = true
+  task.status = 'metadata_pending'
+  task.progress = OSS_PROGRESS_CAP
+  task.message = '正在登记文件信息…'
+
+  // 要求 13：Complete 成功之后、调用 /api/file/insert/ **之前**先落盘。
+  // 这样即使紧接着崩溃，下次启动也只会补写元数据、绝不会重传对象。
+  checkpoint.phase = 'METADATA_PENDING'
+  checkpoint.metadataTarget = { ...checkpoint.target }
+
+  try {
+    await saveCheckpoint(checkpoint)
+  } catch {
+    // 落盘失败：仍然继续 insert（用户要的是文件真正出现在云端），
+    // 代价只是"insert 失败 + 进程崩溃"这种极端组合下会丢掉恢复点。
+  }
 
   const token = getAccessToken()
 
   if (!token) {
+    task.status = 'metadata_pending'
+    task.message = `${SESSION_EXPIRED_MESSAGE}；OSS 已上传，登录后重试只会补写元数据`
+    return
+  }
+
+  await insertMetadataOnly(task, token, run.controller.signal)
+}
+
+/** 把 runTask 里抛出来的错误翻译成任务状态。 */
+async function handleTransferError(
+  task: UploadTask,
+  transfer: ActiveTransfer | null,
+  error: unknown
+): Promise<void> {
+  const checkpoint = transfer?.checkpoint ?? getCheckpoint(task.id) ?? null
+
+  // ---- 暂停：不是错误，绝不 abort、绝不删 checkpoint
+  if (error instanceof UploadPausedError) {
+    if (checkpoint && checkpoint.uploadId) {
+      checkpoint.phase = 'PAUSED'
+
+      try {
+        await saveCheckpoint(checkpoint)
+      } catch {
+        // 忽略：详见 persistPaused 的说明。
+      }
+
+      task.status = 'paused'
+      task.progress = progressFromCheckpoint(checkpoint, task.size)
+      task.message = '已暂停，可继续'
+    } else {
+      // 还没 init 就被暂停：远端没有任何状态，重新开始即可。
+      task.status = 'paused'
+      task.progress = 0
+      task.message = '已暂停（尚未开始上传，可继续）'
+    }
+
+    return
+  }
+
+  // ---- 取消：破坏性路径。checkpoint 必须删掉，multipart 已在 worker 层 abort。
+  if (error instanceof UploadCanceledError) {
+    task.status = 'canceled'
+    task.objectUploaded = false
+    task.progress = 0
+    task.message = '已取消'
+
+    if (checkpoint) {
+      await deleteCheckpointSafely(checkpoint.transferId)
+    }
+
+    return
+  }
+
+  // ---- 本地源身份在**读取过程中**被改动：丢弃 checkpoint，要求重新上传。
+  if (isLocalFileChangedError(error)) {
+    if (checkpoint) {
+      await discardStaleCheckpoint(task, checkpoint, '上传过程中本地文件被改动')
+    } else {
+      task.status = 'error'
+      task.progress = 0
+      task.message = '上传过程中本地文件被改动，请重新上传'
+    }
+
+    return
+  }
+
+  // ---- 目标身份变化：保留 checkpoint（可重试），但本次必须停下。
+  if (error instanceof TransferIdentityChangedError) {
     task.status = 'error'
-    task.message = '登录状态已失效，请重新登录'
+    task.progress = checkpoint ? progressFromCheckpoint(checkpoint, task.size) : 0
+    task.message = describeError(error)
+    return
+  }
+
+  // ---- 登录态失效：不重试、不清理任何上传状态。
+  if (isAuthFailure(error) || error instanceof TransferSessionExpiredError) {
+    if (task.objectUploaded) {
+      task.status = 'metadata_pending'
+      task.progress = OSS_PROGRESS_CAP
+      task.message = `${SESSION_EXPIRED_MESSAGE}；OSS 已上传，登录后重试只会补写元数据`
+      return
+    }
+
+    task.status = 'error'
+    task.progress = checkpoint ? progressFromCheckpoint(checkpoint, task.size) : 0
+    task.message = SESSION_EXPIRED_MESSAGE
+    return
+  }
+
+  /**
+   * ---- 可恢复的传输失败（网络中断 / 超时 / 5xx / 单分片重试预算耗尽）
+   *
+   * 关键行为变化：**不再 abort multipart**。checkpoint 与已完成分片全部保留，
+   * 任务落在"可恢复错误"上，用户点继续就从记录的断点接着传。
+   * 只有显式取消、本地源身份变化、明确不可恢复的任务失效才会销毁旧 multipart。
+   */
+  task.status = 'error'
+  task.progress = checkpoint ? progressFromCheckpoint(checkpoint, task.size) : 0
+
+  if (checkpoint && checkpoint.uploadId) {
+    checkpoint.phase = 'PAUSED'
+
+    try {
+      await saveCheckpoint(checkpoint)
+    } catch {
+      // 忽略：内存里仍有完整的分片记录。
+    }
+
+    task.message = `${describeError(error)}（进度已保留，可继续）`
+    return
+  }
+
+  task.message = describeError(error)
+}
+
+async function runTask(task: UploadTask, run: ActiveRun): Promise<void> {
+  const token = getAccessToken()
+
+  if (!token) {
+    task.status = 'error'
+    task.message = SESSION_EXPIRED_MESSAGE
     return
   }
 
@@ -576,132 +1234,80 @@ async function runTask(task: UploadTask, signal: AbortSignal): Promise<void> {
   //      - 本地文件可能已经被删除 / 移动，那不应该妨碍补写元数据；
   //      - 用户可能已经改了目标目录，但那也不该导致"重新上传一遍"，
   //        否则原来那个已经完整上传、没有 DB 记录的 OSS object 会被永久遗留。
-  //    所以一律使用上传成功时保存下来的 path / parentId / filename。
-  if (task.objectUploaded && task.uploadedPath && task.uploadedParentId > 0) {
-    await insertMetadataOnly(task, token, signal)
+  //    所以一律使用任务开始时冻结的目标快照。
+  if (task.objectUploaded) {
+    await insertMetadataOnly(task, token, run.controller.signal)
     return
   }
 
-  const target = uploadState.target
-  const parentId = target.length > 0 ? target[target.length - 1]?.id : undefined
+  task.status = 'uploading'
+  task.message = ''
 
-  if (!parentId) {
-    task.status = 'error'
-    task.message = '未选择目标云目录'
-    return
-  }
-
-  const stringOfPath = buildStringOfPath(target)
+  let transfer: ActiveTransfer | null = null
 
   try {
-    const info = await statLocalFile(task.path)
+    throwIfStopped(run)
 
-    throwIfAborted(signal)
+    const prepared = await prepareTransfer(task, run)
 
-    task.name = info.name
-    task.size = info.size
-    task.path = info.path
+    if (!prepared) return
 
-    task.progress = 0
-
-    // ① 申请 STS（success / same_file_name 都继续）
-    const ticket = await requestUploadTicket({
-      token,
-      stringOfPath,
-      filename: info.name,
-      parentId,
-      signal
-    })
-
-    task.overwrite = ticket.overwrite
-
-    if (ticket.overwrite) {
-      task.message = '目标目录已有同名文件，将覆盖'
+    transfer = {
+      task,
+      checkpoint: prepared.checkpoint,
+      credentials: prepared.credentials,
+      pauseRequested: false
     }
 
-    // ② OSS 上传真正完成
-    const client = await createOssClient(ticket)
+    // task.id 在恢复场景下就是 checkpoint 的 transferId；这里再对齐一次，
+    // 保证"任务的 id ≡ checkpoint 的 transferId"这条不变式永远成立。
+    task.id = prepared.checkpoint.transferId
+    task.targetParentId = prepared.checkpoint.target.parentId
+    task.targetStringOfPath = prepared.checkpoint.target.stringOfPath
+    task.targetFilename = prepared.checkpoint.target.filename
+    task.overwrite = prepared.checkpoint.overwrite
+    task.progress = progressFromCheckpoint(prepared.checkpoint, task.size)
 
-    if (info.size === 0) {
-      // 空文件没有可拆分的数据，直接 put 一个空 Blob。
-      await putEmptyObject(client, ticket.objectKey, signal)
-      task.progress = OSS_PROGRESS_CAP
-    } else {
-      await uploadMultipart({
-        client,
-        objectKey: ticket.objectKey,
-        localPath: info.path,
-        size: info.size,
-        signal,
-        onBytes: (uploadedBytes) => setOssProgress(task, uploadedBytes)
-      })
+    run.transfer = transfer
 
-      task.progress = OSS_PROGRESS_CAP
-    }
+    try {
+      await executeTransfer(task, run, transfer)
+    } catch (error) {
+      // OSS 明确告诉我们 uploadId 已经不存在（被 abort / 被生命周期规则清理）：
+      // 丢掉旧 checkpoint，重新 init 一个 multipart，**从头干净地重传**。
+      // 绝不允许把旧的 completed parts 带到新的 uploadId 上。
+      if (isOssNoSuchUpload(error) && prepared.checkpoint.uploadId) {
+        await resetCheckpointForFreshUpload(prepared.checkpoint, PART_SIZE)
 
-    task.objectUploaded = true
-    task.uploadedPath = stringOfPath
-    task.uploadedParentId = parentId
-    task.uploadedFilename = info.name
-
-    throwIfAborted(signal)
-
-    // ③ 只有 OSS 完整成功后才写数据库
-    await insertFileRecord({
-      token,
-      stringOfPath,
-      filename: info.name,
-      parentId,
-      signal
-    })
-
-    // ④ 数据库写入成功才算 100%
-    task.progress = 1
-    task.status = 'success'
-    task.message = ticket.overwrite ? '已覆盖同名文件' : ''
-  } catch (error) {
-    if (error instanceof UploadCanceledError) {
-      task.status = 'canceled'
-
-      if (task.objectUploaded) {
-        // OSS 已经传完，只是元数据没写：保留 99%，重试时只补写数据库。
-        task.progress = OSS_PROGRESS_CAP
-        task.message = '已取消：OSS 已上传，文件元数据尚未写入'
-      } else {
         task.progress = 0
-        task.message = '已取消'
+        task.message = '远端分片任务已失效，正在重新上传…'
+
+        activeMultipart = null
+
+        await executeTransfer(task, run, transfer)
+        return
       }
 
-      return
+      throw error
+    }
+  } catch (error) {
+    await handleTransferError(task, transfer, error)
+  } finally {
+    if (run.transfer === transfer) {
+      run.transfer = null
     }
 
-    if (task.objectUploaded) {
-      // OSS 已经成功，只是元数据没写进去：不要偷偷重传整个文件。
-      task.status = 'error'
-      task.progress = OSS_PROGRESS_CAP
-
-      // 登录态失效（401/403，例如后端 tokenVersion 被提升）：
-      // 保留 99% 恢复状态与 objectUploaded 快照，重新登录后重试只补写元数据。
-      task.message = isAuthFailure(error)
-        ? `${SESSION_EXPIRED_MESSAGE}；OSS 已上传，登录后重试只会补写元数据`
-        : `OSS 已上传成功，但文件元数据写入失败：${describeError(error)}`
-
-      return
+    if (transfer && activeMultipart?.uploadId === transfer.checkpoint.uploadId) {
+      activeMultipart = null
     }
-
-    task.status = 'error'
-    task.progress = 0
-
-    // 登录态失效要给出明确原因，而不是笼统的上传失败。
-    // 注意：这里**不做任何清理**（不清任务、不清目标目录、不触发 logout）——
-    // OSS 上可能已经有传完的对象，清掉这些状态会让它变成没人认领的孤儿对象。
-    task.message = isAuthFailure(error)
-      ? SESSION_EXPIRED_MESSAGE
-      : describeError(error)
   }
 }
 
-/** 设置当前目标云目录（上传进行中不允许切换）。 */
+// ---------------------------------------------------------------------------
+// 队列操作
+// ---------------------------------------------------------------------------
+
+/** 设置当前目标云目录（上传进行中不允许切换；已经开始的传输永远用它自己的冻结快照）。 */
 export function setUploadTarget(target: Breadcrumb[]): void {
   if (uploadState.running) return
 
@@ -734,7 +1340,10 @@ export async function addPaths(paths: string[]): Promise<AddPathsResult> {
     const duplicated = uploadState.tasks.some(
       (task) =>
         task.path === path &&
-        (task.status === 'pending' || task.status === 'uploading')
+        (task.status === 'pending' ||
+          task.status === 'uploading' ||
+          task.status === 'paused' ||
+          task.status === 'pausing')
     )
 
     if (duplicated) continue
@@ -746,10 +1355,11 @@ export async function addPaths(paths: string[]): Promise<AddPathsResult> {
       if (generation !== uploadSessionGeneration) return result
 
       uploadState.tasks.push({
-        id: nextTaskId(),
+        id: createTransferId(),
         path: info.path,
         name: info.name,
         size: info.size,
+        modifiedAtMs: info.modifiedAtMs,
         // 记下创建者账号（只记账号名，不记令牌）：
         // 会话切换时靠它判断这个恢复任务还能不能留。
         ownerUsername: getCurrentUsername(),
@@ -758,9 +1368,9 @@ export async function addPaths(paths: string[]): Promise<AddPathsResult> {
         message: '',
         overwrite: false,
         objectUploaded: false,
-        uploadedPath: '',
-        uploadedParentId: 0,
-        uploadedFilename: ''
+        targetStringOfPath: '',
+        targetParentId: 0,
+        targetFilename: ''
       })
 
       result.added += 1
@@ -775,6 +1385,85 @@ export async function addPaths(paths: string[]): Promise<AddPathsResult> {
 }
 
 /**
+ * 从 checkpoint 恢复一个任务（**不校验本地文件**）。
+ *
+ * METADATA_PENDING 的任务即使本地文件已经被删除 / 移动也必须恢复：
+ * OSS 对象已经完整存在，此时本地源已经不再必要。
+ */
+const taskFromCheckpoint = (checkpoint: UploadCheckpoint): UploadTask => {
+  const metadataPending = checkpoint.phase === 'METADATA_PENDING'
+  // METADATA_PENDING 用记录里自带的落库快照；其余阶段用冻结的传输目标。
+  const target = metadataPending
+    ? (checkpoint.metadataTarget ?? checkpoint.target)
+    : checkpoint.target
+
+  return {
+    id: checkpoint.transferId,
+    path: checkpoint.source.path,
+    name: checkpoint.source.filename,
+    size: checkpoint.source.size,
+    modifiedAtMs: checkpoint.source.modifiedAtMs,
+    ownerUsername: checkpoint.ownerUsername,
+    status: metadataPending ? 'metadata_pending' : 'paused',
+    progress: progressFromCheckpoint(checkpoint, checkpoint.source.size),
+    message: metadataPending
+      ? '正在登记文件信息…（可重试，不会重传文件）'
+      : '上次未传完，已暂停，可继续',
+    overwrite: checkpoint.overwrite,
+    objectUploaded: metadataPending,
+    targetStringOfPath: target.stringOfPath,
+    targetParentId: target.parentId,
+    targetFilename: target.filename
+  }
+}
+
+/**
+ * 加载并恢复**当前账号**的续传任务。
+ *
+ * 只由上传窗口调用：
+ *   - 主窗口的任务列表永远是空的，让它去写会把上传窗口的状态覆盖掉；
+ *   - checkpoint 按 ownerUsername 过滤，**绝不**把上一个账号的传输状态暴露给新账号。
+ *
+ * 恢复出来的任务一律是 paused / metadata_pending，**不会自动开始**——
+ * 是否继续由用户决定。
+ *
+ * 返回恢复出来的任务数。
+ */
+export async function restoreUploadCheckpoints(): Promise<number> {
+  const username = getCurrentUsername()
+
+  if (!username) return 0
+
+  const generation = uploadSessionGeneration
+
+  await loadCheckpoints()
+
+  if (generation !== uploadSessionGeneration) return 0
+
+  const restored: UploadTask[] = []
+
+  for (const checkpoint of listCheckpointsForOwner(username)) {
+    if (uploadState.tasks.some((task) => task.id === checkpoint.transferId)) continue
+
+    restored.push(taskFromCheckpoint(checkpoint))
+  }
+
+  if (restored.length === 0) return 0
+
+  uploadState.tasks.push(...restored)
+
+  return restored.length
+}
+
+/**
+ * 上一次加载 checkpoint 时是否出现过损坏 / 读取失败。
+ *
+ * 损坏的记录会被整条丢弃（绝不猜测字段含义），因此界面应该明确告诉用户
+ * "有一部分续传记录没能恢复，需要重新上传"，而不是静默地少几个任务。
+ */
+export const checkpointsRestoreFailed = (): boolean => checkpointLoadFailed()
+
+/**
  * 这个任务是否"OSS 已成功但数据库还没落库"。
  *
  * 这种任务不能被悄悄丢掉：丢掉它等于把一个已经存在于 OSS、
@@ -784,6 +1473,36 @@ export async function addPaths(paths: string[]): Promise<AddPathsResult> {
 export const isMetadataPendingTask = (task: UploadTask): boolean =>
   task.objectUploaded && task.status !== 'success'
 
+/**
+ * 破坏性清理一个任务：best-effort abort multipart + 删除 checkpoint。
+ *
+ * **只有显式取消 / 放弃任务才会调用它**——暂停与正常退出绝不走这里。
+ */
+async function destroyTransfer(task: UploadTask): Promise<void> {
+  const checkpoint = getCheckpoint(task.id)
+
+  if (checkpoint && checkpoint.uploadId && checkpoint.objectKey) {
+    const controller = new AbortController()
+
+    try {
+      const credentials = new TransferCredentials({
+        identity: checkpoint.target,
+        expectedObjectKey: checkpoint.objectKey,
+        getToken: getAccessToken,
+        signal: controller.signal
+      })
+
+      await abortMultipartSafely(credentials, checkpoint.objectKey, checkpoint.uploadId)
+    } catch {
+      // best-effort：失败也只是留下由 OSS 生命周期规则清理的分片。
+    }
+  }
+
+  await deleteCheckpointSafely(task.id)
+
+  task.objectUploaded = false
+}
+
 /** 移除一个任务（上传中的任务、以及元数据待补写的任务都不允许移除）。 */
 export function removeTask(taskId: string): void {
   const index = uploadState.tasks.findIndex((task) => task.id === taskId)
@@ -792,68 +1511,113 @@ export function removeTask(taskId: string): void {
 
   const task = uploadState.tasks[index]
 
-  if (task.status === 'uploading' || isMetadataPendingTask(task)) return
+  if (
+    task.status === 'uploading' ||
+    task.status === 'pausing' ||
+    isMetadataPendingTask(task)
+  ) {
+    return
+  }
 
   uploadState.tasks.splice(index, 1)
+
+  // 有 checkpoint 的任务必须先做破坏性清理，否则 OSS 上会留下一个
+  // 永远没人认领的 multipart（用户以为文件已经"移除"了）。
+  void destroyTransfer(task)
 }
 
-/** 把失败/取消的任务重新排队。 */
-export function retryTask(taskId: string): void {
+/**
+ * 把一个失败 / 取消 / 已暂停的任务重新排队（"继续"按钮）。
+ *
+ * 对 METADATA_PENDING 的任务，这只是"补写元数据"的重试：runTask 会走
+ * insertMetadataOnly 分支，绝不重新上传对象。
+ */
+export function resumeTask(taskId: string): void {
   const task = uploadState.tasks.find((item) => item.id === taskId)
 
-  if (!task || task.status === 'uploading') return
+  if (!task || task.status === 'uploading' || task.status === 'pausing') return
+
+  if (isMetadataPendingTask(task)) {
+    task.status = 'metadata_pending'
+    task.message = '正在登记文件信息…'
+    task.progress = OSS_PROGRESS_CAP
+    return
+  }
 
   task.status = 'pending'
   task.message = ''
-  task.progress = task.objectUploaded ? OSS_PROGRESS_CAP : 0
 }
 
 /**
  * 清空已结束（完成 / 失败 / 取消）的任务。
  *
- * "OSS 已成功但元数据待补写"的任务会被保留：丢掉它等于永久遗留一个
- * OSS 上存在、`files` 表里却没有记录的对象。这类任务只能 Retry。
+ * - "OSS 已成功但元数据待补写"的任务会被保留：丢掉它等于永久遗留一个
+ *   OSS 上存在、`files` 表里却没有记录的对象。这类任务只能 Retry。
+ * - 被清掉的失败任务如果还有 checkpoint，先做一次破坏性清理，避免留下孤儿 multipart。
  */
 export function clearFinishedTasks(): void {
   for (let index = uploadState.tasks.length - 1; index >= 0; index -= 1) {
     const task = uploadState.tasks[index]
 
-    if (task.status === 'uploading' || task.status === 'pending') continue
+    if (
+      task.status === 'uploading' ||
+      task.status === 'pausing' ||
+      task.status === 'pending' ||
+      task.status === 'paused'
+    ) {
+      continue
+    }
+
     if (isMetadataPendingTask(task)) continue
 
     uploadState.tasks.splice(index, 1)
+
+    void destroyTransfer(task)
   }
 }
 
-/** 清空整个列表，但同样保留"元数据待补写"的任务。 */
+/** 清空整个列表，但同样保留"元数据待补写"的任务与正在上传/暂停中的任务。 */
 export function clearAllTasks(): void {
   if (uploadState.running) return
 
   for (let index = uploadState.tasks.length - 1; index >= 0; index -= 1) {
-    if (isMetadataPendingTask(uploadState.tasks[index])) continue
+    const task = uploadState.tasks[index]
+
+    if (isMetadataPendingTask(task)) continue
+    if (task.status === 'paused' || task.status === 'pausing') continue
 
     uploadState.tasks.splice(index, 1)
+
+    void destroyTransfer(task)
   }
 }
 
+// ---------------------------------------------------------------------------
+// 运行控制：开始 / 暂停 / 继续 / 取消
+// ---------------------------------------------------------------------------
+
 /**
- * 开始上传：文件串行，单文件内部 3 个分片并行。
- * 每次运行都会新建 AbortController，作为取消上传的唯一信号源。
+ * 开始（或继续）上传：文件串行，单文件内部 3 个分片并行。
+ *
+ * 队列里包含 pending / paused / error / canceled / metadata_pending 的任务；
+ * 每次运行都会新建 AbortController，**只有显式取消才会 abort 它**。
  */
 export async function startUpload(): Promise<void> {
   if (uploadState.running) return
 
-  const queue = uploadState.tasks.filter(
-    (task) =>
-      task.status === 'pending' ||
-      task.status === 'error' ||
-      task.status === 'canceled'
-  )
+  const queue = uploadState.tasks.filter((task) => RESUMABLE_STATUSES.has(task.status))
 
   if (queue.length === 0) return
 
   const controller = new AbortController()
-  runController = controller
+
+  const run: ActiveRun = {
+    controller,
+    pauseRequested: false,
+    transfer: null
+  }
+
+  activeRun = run
   uploadState.running = true
 
   /**
@@ -880,7 +1644,13 @@ export async function startUpload(): Promise<void> {
 
       for (const task of queue) {
         if (controller.signal.aborted) break
-        await runTask(task, controller.signal)
+        if (run.pauseRequested) break
+
+        await runTask(task, run)
+
+        // 暂停是"停在这一批的安全边界"：本轮不再开始下一个文件，
+        // 剩下的任务保持原状（pending 的还没落任何 checkpoint）。
+        if (run.pauseRequested) break
       }
     } catch (error) {
       // 登记阶段就失败：换成带清晰提示的错误（契约与之前一致）。
@@ -905,57 +1675,159 @@ export async function startUpload(): Promise<void> {
     // 只有上面的生命周期 promise 真正结束（含 Rust 侧清理）之后，才允许：
     //   - running 变 false（否则新上传可能在旧清理还没落地时就开始，
     //     旧的那次 setUploadActive(false) 甚至可能盖掉新的 active=true）
-    //   - runningPromise 置空、runController 释放
+    //   - runningPromise 置空、activeRun 释放
     uploadState.running = false
     runningPromise = null
 
-    if (runController === controller) {
-      runController = null
+    if (activeRun === run) {
+      activeRun = null
     }
   }
 }
 
 /**
- * 取消上传。
+ * 同步置位"暂停请求"。
  *
- * 做两件事：
- *   1. 设置 cancellation flag（abort signal）：进行中的分片停止重试，worker 尽快退出；
- *   2. 如果此刻有进行中的 multipart，**立刻**发一次 best-effort `abortMultipartUpload`，
- *      不必等当前分片请求返回。
+ * 刻意不落盘、不 await：调用方（会话切换）需要它在**任何 await 之前**生效，
+ * 否则新会话可能已经初始化了自己的状态，却被这次清理抹掉。
+ *
+ * 返回当前活动传输（需要落盘 PAUSED 时使用）。
+ */
+function requestPauseSync(): ActiveTransfer | null {
+  const run = activeRun
+
+  if (!run) return null
+
+  const transfer = run.transfer
+
+  // METADATA_PENDING 阶段没有可暂停的东西：OSS 对象已经完整存在，
+  // 剩下的只是一次极短的元数据登记。此时按暂停不应该掐断它。
+  if (transfer && transfer.task.status === 'metadata_pending') return null
+
+  run.pauseRequested = true
+
+  if (!transfer) return null
+
+  transfer.pauseRequested = true
+
+  if (transfer.task.status === 'uploading') {
+    transfer.task.status = 'pausing'
+    transfer.task.message = '正在暂停…'
+  }
+
+  return transfer
+}
+
+/**
+ * 暂停上传（**不是取消**）。
+ *
+ * 为什么不用 `client.cancel()`：
+ *   已确认本地安装的 ali-oss 6.23.0 里 `client.cancel()`（lib/common/parallel.js）
+ *   只做两件事——置 `options.cancelFlag = true`、销毁 `multipartUploadStreams`
+ *   （那是 Node 流式上传才有的东西）。它**不会**中断浏览器端已经发出的 XHR：
+ *   本项目的 `uploadPart` 走的是 `urllib.request`，没有 cancelFlag 检查，
+ *   也没有任何 abort 通道。也就是说 `cancel()` 对"让暂停更跟手"毫无帮助，
+ *   反而会永久污染这个 client 的 cancelFlag。
+ *
+ *   所以这里选方案 A：让至多 3 个在途分片请求自然跑到安全边界，
+ *   每个成功返回的分片照常记录并落盘；没有在途请求时立即停止调度。
+ *
+ * 暂停的正确性不依赖"服务端是否多了一个未记录的分片"：
+ * 下次 Resume 会对本地没有记录的分片号重传，这是幂等且安全的。
+ */
+export async function pauseUploads(): Promise<void> {
+  const transfer = requestPauseSync()
+
+  if (!transfer) return
+
+  await persistPaused(transfer)
+}
+
+/**
+ * 显式取消上传（**破坏性**）。
+ *
+ *   1. 阻止新分片被调度（abort signal）；
+ *   2. 立刻发起一次 best-effort AbortMultipartUpload（不必等在途分片返回）；
+ *   3. 等 worker 真正退出；
+ *   4. 收尾再 abort 一次（清掉"第一次 abort 之后才完成"的分片）；
+ *   5. 删除本地 checkpoint；
+ *   6. 按既有 UX 把任务标记为已取消。
  *
  * 注意语义：第 2 步只是"尽早发出清理请求"，**不保证**在途分片立刻终止
- * （HTTP 请求无法强制中断）。真正的收尾仍在 multipart 的失败/取消路径里完成
+ * （HTTP 请求无法强制中断）。真正的收尾在 multipart 的取消路径里完成
  * （abort -> Promise.allSettled(workers) -> 再次 abort）。
  */
-export function cancelUpload(): void {
-  const controller = runController
+export async function cancelUpload(): Promise<void> {
+  const run = activeRun
 
-  if (controller && !controller.signal.aborted) {
-    controller.abort()
+  if (run && !run.controller.signal.aborted) {
+    run.controller.abort()
   }
 
   // 不 await：立刻发起、后台完成，绝不阻塞调用方（取消/退出都要保持有界）。
   void abortActiveMultipartNow()
 
+  const cleanups: Array<Promise<void>> = []
+
   for (const task of uploadState.tasks) {
-    if (task.status === 'pending') {
+    if (isMetadataPendingTask(task)) {
+      // OSS 对象已经完整存在：取消它等于制造一个没有 DB 记录的孤儿对象。
+      // 这类任务只能"重试补写元数据"，不能取消。
+      continue
+    }
+
+    if (task.status === 'uploading' || task.status === 'pausing') {
+      // 正在运行的这一个由 runTask 的取消路径负责收尾（含 abort 与删 checkpoint）。
+      continue
+    }
+
+    if (task.status === 'pending' || task.status === 'paused' || task.status === 'error') {
       task.status = 'canceled'
-      task.progress = task.objectUploaded ? OSS_PROGRESS_CAP : 0
-      task.message = task.objectUploaded
-        ? '已取消：OSS 已上传，文件元数据尚未写入'
-        : '已取消'
+      task.progress = 0
+      task.message = '已取消'
+
+      cleanups.push(destroyTransfer(task))
     }
   }
+
+  await Promise.all(cleanups)
 }
 
-/** 对当前进行中的 multipart 发起一次 best-effort abort（失败静默）。 */
-const abortActiveMultipartNow = async (): Promise<void> => {
-  const multipart = activeMultipart
+/** 取消单个任务（破坏性；与"暂停"严格区分）。 */
+export async function cancelTask(taskId: string): Promise<void> {
+  const task = uploadState.tasks.find((item) => item.id === taskId)
 
-  if (!multipart) return
+  if (!task) return
 
-  await abortMultipartSafely(multipart.client, multipart.objectKey, multipart.uploadId)
+  // 元数据待补写的任务不能被取消：那会留下一个用户看不到、也删不掉的 OSS 对象。
+  if (isMetadataPendingTask(task)) return
+
+  if (task.status === 'uploading' || task.status === 'pausing') {
+    // 它是当前运行中的任务：abort 这一轮（worker 会走破坏性清理路径）。
+    const run = activeRun
+
+    if (run && !run.controller.signal.aborted) {
+      run.controller.abort()
+    }
+
+    void abortActiveMultipartNow()
+
+    return
+  }
+
+  task.status = 'canceled'
+  task.progress = 0
+  task.message = '已取消'
+
+  await destroyTransfer(task)
 }
+
+/** 让一个已暂停 / 失败的任务重新排队（等价于"继续"）。 */
+export const retryTask = resumeTask
+
+// ---------------------------------------------------------------------------
+// 生命周期
+// ---------------------------------------------------------------------------
 
 /**
  * 当前这一轮上传是否已经**完全**结束（含 Rust 侧 setUploadActive(false) 清理）。
@@ -971,6 +1843,8 @@ export function waitForUploadIdle(): Promise<void> {
  * 有界等待上传结束：返回是否在超时前真正 idle。
  *
  * 返回 `false` 只表示"超时了，任务还在收尾"，**不能**当成"上传已经停止"。
+ * 对暂停/退出路径来说这完全可以接受：checkpoint 已经落盘，
+ * 带着在途分片退出也不会破坏续传的正确性。
  */
 export function waitForUploadIdleBounded(timeoutMs: number): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
@@ -994,39 +1868,47 @@ export function waitForUploadIdleBounded(timeoutMs: number): Promise<boolean> {
 /**
  * 会话变化（退出登录 / 换账号 / 登录）时清理与账号绑定的上传状态。
  *
- * 顺序很重要（必须是"先清界面状态、后等待收尾"）：
- *   ① 请求取消：abort signal + 立刻发一次 best-effort multipart abort；
- *   ② **立即**重算 tasks 与清空 target —— 都在任何 await 之前完成，
- *      否则新会话可能已经初始化了自己的状态，却被这次清理抹掉；
- *   ③ 再对上一会话的上传做有界等待。
+ * **语义变化**：以前这里是"取消上传"（abort multipart），现在改成"暂停"。
+ * 登录态变化既不是用户显式取消，也不是任务失效，没有任何理由销毁一个
+ * 已经传了一半的 multipart——按仓库的破坏性清理约定，只有
+ * 显式取消 / 本地源身份变化 / 明确不可恢复的失效才允许 abort。
  *
- * 保留规则（**只保留恢复任务**）：
- *   - 普通 / 未完成的任务一律清掉（与之前完全一致）；
- *   - 只有"OSS 对象已经完整上传、只差写元数据"的任务才可能留下，
- *     而且必须属于**当前（或刚刚离开的）账号**——绝不把一个账号的待办暴露给另一个账号。
- *   - 任务上只记了账号名，没有令牌；重试时用的是那时最新的访问令牌，
- *     并且只走补写元数据的分支，绝不会重传 OSS 对象。
+ * 顺序很重要：
+ *   ① 同步置位暂停请求并**立即**重算 tasks 与 target（都在任何 await 之前），
+ *      否则新会话可能已经初始化了自己的状态，却被这次清理抹掉；
+ *   ② 再把 PAUSED 落盘；
+ *   ③ 最后对上一会话的上传做有界等待。
+ *
+ * 保留规则（**只保留仍然属于当前/刚离开账号的恢复类任务**）：
+ *   - 普通任务一律清掉（与之前一致）；
+ *   - "元数据待补写"的任务即使跨登出也要留下，否则会遗留无记录的 OSS 对象；
+ *   - paused / pausing 的任务代表磁盘上真实存在的 checkpoint，留下它们，
+ *     账号切回来时还能继续（checkpoint 本身也按 ownerUsername 过滤）。
  *
  * 第 ③ 步**不再**清 tasks/target：那时新会话可能已经加载了自己的 root。
  * 被移出界面的任务对象仍被 worker 持有（startUpload 捕获了任务引用），
- * 它们会照常走完取消 / abort / 清理流程，不影响收尾。
+ * 它们会照常走完暂停 / 清理流程，不影响收尾。
  */
 async function resetUploadStateForSessionChange(change: SessionChange): Promise<void> {
   // 先让代际号前进：所有在途的异步操作（addPaths 等）从此刻起一律失效。
   uploadSessionGeneration += 1
 
-  // ① 请求取消（没有活动上传时是空操作）。
-  cancelUpload()
+  // ① 同步暂停（不 abort、不删 checkpoint）。
+  const transferToPersist = requestPauseSync()
 
   // ② 立即重算任务列表与目标目录——必须在第一个 await 之前。
   const hadTasks = uploadState.tasks.length > 0
 
   // 登出时 currentUsername 为空串：此时保留"刚离开的那个账号"的恢复任务，
-  // 等它重新登录后还能补写元数据；换账号时保留的是新账号自己的任务。
+  // 等它重新登录后还能继续 / 补写元数据；换账号时保留的是新账号自己的任务。
   const keepUsername = change.currentUsername || change.previousUsername
 
   const keptTasks = uploadState.tasks.filter(
-    (task) => isMetadataPendingTask(task) && task.ownerUsername === keepUsername
+    (task) =>
+      task.ownerUsername === keepUsername &&
+      (isMetadataPendingTask(task) ||
+        task.status === 'paused' ||
+        task.status === 'pausing')
   )
 
   uploadState.tasks.splice(0, uploadState.tasks.length, ...keptTasks)
@@ -1043,18 +1925,26 @@ async function resetUploadStateForSessionChange(change: SessionChange): Promise<
     }
   }
 
-  // ③ 有界等待上一会话的上传收尾：不因为某个分片卡住就无限拖延
-  //    （Rust 侧退出另有硬超时兜底）。这里绝不再清 tasks/target。
+  // ③ 把 PAUSED 落到磁盘，再有界等待上一会话的上传收尾。
+  if (transferToPersist) {
+    await persistPaused(transferToPersist)
+  }
+
   await waitForUploadIdleBounded(UPLOAD_CLEANUP_TIMEOUT_MS)
 }
 
-// 账号被清空 / 更换账号 / 重新登录时自动清理或保留，避免状态跨账号泄漏。
+// 账号被清空 / 更换账号 / 重新登录时自动暂停或保留，避免状态跨账号泄漏。
 onSessionChanged((change) => {
   void resetUploadStateForSessionChange(change)
 })
 
-/** 窗口卸载时调用：取消进行中的上传并释放引用。 */
+/**
+ * 窗口卸载时调用：**暂停**进行中的上传并释放引用。
+ *
+ * 卸载上传窗口不等于用户取消上传：暂停后 multipart 与 checkpoint 都还在，
+ * 重新打开上传窗口就能继续。
+ */
 export function disposeUpload(): void {
-  cancelUpload()
+  void pauseUploads()
   activeMultipart = null
 }

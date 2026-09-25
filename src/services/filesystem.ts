@@ -16,22 +16,44 @@ import type {
   UploadTargetHint
 } from '../types'
 
-/** 读取本地文件元信息（存在性 + 普通文件校验 + 文件名/大小/绝对路径）。 */
+/** 读取本地文件元信息（存在性 + 普通文件校验 + 文件名/大小/mtime/绝对路径）。 */
 export const statLocalFile = (path: string): Promise<LocalFileInfo> =>
   invoke<LocalFileInfo>('stat_local_file', { path })
+
+/** 分片读取时期望的本地源快照；Rust 侧在读取前后各校验一次。 */
+export interface ChunkSourceExpectation {
+  /** 期望的文件大小（字节）。 */
+  size: number
+  /**
+   * 期望的 mtime（epoch 毫秒）。
+   * 传 0 表示"该文件系统不提供 mtime"，此时只校验大小。
+   */
+  modifiedAtMs: number
+}
 
 /**
  * 读取一个分片。
  *
  * Rust 侧以 `tauri::ipc::Response::new(bytes)` 返回原始二进制，
  * 前端拿到的就是 ArrayBuffer —— 没有 base64，也没有 JSON 序列化。
+ *
+ * `expected` 是可选的本地源快照：传了它，Rust 会在**读取之前**与**读取之后**
+ * 各比对一次 size / mtime，不一致就返回 "本地文件在上传过程中被改动" 的错误。
+ * 这样"上传进行中文件被追加/替换"不可能悄悄合成出一个损坏的对象。
  */
 export const readFileChunk = (
   path: string,
   offset: number,
-  length: number
+  length: number,
+  expected?: ChunkSourceExpectation
 ): Promise<ArrayBuffer> =>
-  invoke<ArrayBuffer>('read_file_chunk', { path, offset, length })
+  invoke<ArrayBuffer>('read_file_chunk', {
+    path,
+    offset,
+    length,
+    expectedSize: expected ? expected.size : null,
+    expectedModifiedAtMs: expected ? expected.modifiedAtMs : null
+  })
 
 /** 把本地绝对路径放进 Rust 侧待上传队列（首页选择文件后调用）。 */
 export const queueUploadPaths = (paths: string[]): Promise<QueueUploadResult> =>
