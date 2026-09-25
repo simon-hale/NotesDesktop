@@ -8,6 +8,8 @@
  *
  * 2. **绝不持久化任何凭据**：没有 JWT、没有 AccessKey ID / Secret、没有 SecurityToken。
  *    STS 只在内存里活着（见 transfer-credentials.ts），重启后重新申请即可。
+ *    持久化的是**非敏感的传输身份**：完整 OSS 范围（bucket / region / objectKey）、
+ *    uploadId 与本地分片表。
  *
  * 3. **本地 PartNumber + ETag 是唯一事实来源**。
  *    完成合并时只使用这里记录的分片列表，绝不从 `ListParts` 反推：
@@ -67,7 +69,20 @@ export interface StoredUploadCheckpoint {
   ownerUsername: string
   source: UploadCheckpointSource
   target: UploadCheckpointTarget
-  /** 冻结的 OSS objectKey（刷新 STS 时必须保持一致）。 */
+  /**
+   * 冻结的 OSS 范围：bucket + region + objectKey。
+   *
+   * 三者一起构成这次传输**不可变**的远端身份（schema v2 起完整持久化）：
+   *   - objectKey 单独一项不足以证明"刷新回来的凭证仍属于同一个对象"——
+   *     同一个 key 在不同 bucket / region 里是完全不同的对象；
+   *   - 因此续传时三者都必须来自磁盘，并在**每一次** STS 刷新后逐一比对，
+   *     任何一项变化都必须 fail closed（见 transfer-credentials.ts）。
+   *
+   * 空串只可能出现在"还没申请过 STS"的内存记录上；
+   * 落盘记录的这三项都必须非空（见 isValidStored）。
+   */
+  bucket: string
+  region: string
   objectKey: string
   /** 空串表示"还没 init"。 */
   uploadId: string
@@ -189,8 +204,17 @@ const isValidStored = (value: unknown): value is StoredUploadCheckpoint => {
   if (typeof record.ownerUsername !== 'string') return false
   if (!isSource(record.source)) return false
   if (!isTarget(record.target)) return false
+
+  // ---- 完整的冻结 OSS 范围（schema v2）
+  //
+  // 三项都必须非空：本项目只会在"已经拿到第一张 STS ticket"之后才落盘，
+  // 因此任何一项为空都说明记录不完整 —— 宁可不恢复，也不能凭一个残缺范围
+  // 去比对刷新回来的凭证（那正是把分片传进错误 bucket 的路径）。
+  if (!isNonEmptyString(record.bucket)) return false
+  if (!isNonEmptyString(record.region)) return false
   if (!isNonEmptyString(record.objectKey)) return false
-  // uploadId 允许为空（刚冻结目标、还没 init）。
+
+  // uploadId 允许为空（刚冻结目标、还没 init；NoSuchUpload 重置后也会为空）。
   if (typeof record.uploadId !== 'string') return false
   if (!isPositiveInt(record.partSize)) return false
   if (!Array.isArray(record.parts)) return false
@@ -244,6 +268,8 @@ const toStored = (checkpoint: UploadCheckpoint): StoredUploadCheckpoint => ({
   ownerUsername: checkpoint.ownerUsername,
   source: { ...checkpoint.source },
   target: { ...checkpoint.target },
+  bucket: checkpoint.bucket,
+  region: checkpoint.region,
   objectKey: checkpoint.objectKey,
   uploadId: checkpoint.uploadId,
   partSize: checkpoint.partSize,
@@ -375,7 +401,7 @@ export const listCheckpoints = (): UploadCheckpoint[] => [...cache.values()]
 export const listCheckpointsForOwner = (ownerUsername: string): UploadCheckpoint[] =>
   [...cache.values()].filter((checkpoint) => checkpoint.ownerUsername === ownerUsername)
 
-/** 新建一条内存记录（不落盘；调用方在 init 之后才持久化）。 */
+/** 新建一条内存记录（不落盘；调用方在拿到第一张 STS 之后才持久化）。 */
 export function createCheckpoint(options: {
   transferId: string
   ownerUsername: string
@@ -390,6 +416,9 @@ export function createCheckpoint(options: {
     ownerUsername: options.ownerUsername,
     source: { ...options.source },
     target: { ...options.target },
+    // 全新的传输：OSS 范围要等第一张 STS ticket 才能冻结（见 upload.ts）。
+    bucket: '',
+    region: '',
     objectKey: '',
     uploadId: '',
     partSize: 0,
@@ -432,6 +461,10 @@ export async function deleteCheckpoint(transferId: string): Promise<void> {
  * 只用于 OSS 明确告诉我们 uploadId 已经不存在（NoSuchUpload / 生命周期清理）的场景。
  * 语义上等价于"丢掉旧 checkpoint，重新 init 一个 multipart"：
  * **绝不允许把旧的 completed parts 带到新的 uploadId 上**。
+ *
+ * ⚠️ 冻结的 OSS 范围（bucket / region / objectKey）**保持不变**：
+ * 重新 init 的是同一个对象上的一个新 multipart，而不是换一个对象。
+ * 范围变化走的是完全不同的路径（fail closed，见 transfer-credentials.ts）。
  */
 export async function resetCheckpointForFreshUpload(
   checkpoint: UploadCheckpoint,

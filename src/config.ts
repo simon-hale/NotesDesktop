@@ -57,8 +57,14 @@ export const UPLOAD_CHECKPOINT_STORE_KEY = 'uploadCheckpoints'
  * 读取时版本不匹配的记录一律**丢弃**（而不是猜测字段含义）：
  * 丢掉一个旧记录只会让那个文件重新上传一遍；错误地解释它则可能
  * 用一份不完整的 ETag 列表去 Complete，合成出损坏的对象。
+ *
+ * 版本历史：
+ *   1 → 2：checkpoint 增加完整的 OSS 范围（bucket / region），
+ *          使续传时能校验刷新回来的 STS 凭证仍属于同一个存储空间，
+ *          而不是只比对 objectKey。项目尚未发布，v1 记录直接作废
+ *          （不做有风险的半迁移）；它们残留的远端分片由 OSS 生命周期规则回收。
  */
-export const UPLOAD_CHECKPOINT_SCHEMA_VERSION = 1
+export const UPLOAD_CHECKPOINT_SCHEMA_VERSION = 2
 
 // ---- OSS 上传参数（与现有 NotesFrontend 的 ossUpload.async.js 保持一致）----
 

@@ -89,6 +89,20 @@ const hasDestructible = computed(() =>
   uploadState.tasks.some((task) => task.status === 'paused')
 )
 
+/**
+ * 是否还有"真正在传分片"的任务。
+ *
+ * 刻意**不包含** `metadata_pending`：那种任务的 OSS 对象已经完整存在，
+ * 只剩一次元数据登记，没有可暂停的东西（详见 upload.ts 的 insertMetadataOnly）。
+ * 对已经完成 OSS 传输的文件展示"暂停"是误导，因此这里直接不显示暂停按钮；
+ * 服务层的 `pauseUploads()` 也会独立地忽略这种请求，UI 只是第一道防线。
+ */
+const hasPausable = computed(() =>
+  uploadState.tasks.some(
+    (task) => task.status === 'uploading' || task.status === 'pausing'
+  )
+)
+
 const hasFinished = computed(() =>
   uploadState.tasks.some(
     (task) =>
@@ -360,15 +374,27 @@ const handlePause = async (): Promise<void> => {
     : '正在等在途分片收尾，进度已经保存，可随时继续'
 }
 
-/** 破坏性取消：abort multipart + 删除本地 checkpoint。 */
+/**
+ * 破坏性取消：abort multipart + 删除本地 checkpoint。
+ *
+ * 当前文件已经走完 OSS 传输（只差登记元数据）时，文案必须说清楚：
+ * 这一项不会被取消——OSS 对象已经完整存在，中断它只会留下一个
+ * 用户看不到也删不掉的孤儿对象。此时取消只会让这一批在它之后停下。
+ */
 const handleCancel = async (): Promise<void> => {
   if (cancelling.value) return
+
+  const finalizing = uploadState.tasks.some(
+    (task) => task.status === 'metadata_pending'
+  )
 
   let confirmed = false
 
   try {
     confirmed = await confirmDialog(
-      '取消上传会中止未完成的分片上传，并删除本地续传记录（已上传的部分将被丢弃）。确定取消吗？',
+      finalizing
+        ? '当前文件的分片已经上传完成，正在登记文件信息，这一步不会被取消（否则会在云端留下无法管理的对象）。取消只会让这一批不再开始下一个文件。确定吗？'
+        : '取消上传会中止未完成的分片上传，并删除本地续传记录（已上传的部分将被丢弃）。确定取消吗？',
       {
         title: '取消上传',
         kind: 'warning',
@@ -696,7 +722,7 @@ onUnmounted(() => {
           清除已结束
         </button>
         <button
-          v-if="uploadState.running"
+          v-if="uploadState.running && hasPausable"
           class="btn btn--small"
           type="button"
           :disabled="pausing"

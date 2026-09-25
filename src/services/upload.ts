@@ -165,6 +165,22 @@ interface ActiveRun {
   /** 本轮是否被要求暂停（暂停不 abort）。 */
   pauseRequested: boolean
   transfer: ActiveTransfer | null
+  /**
+   * 本轮**正在处理**的任务（含"只补写元数据"那条没有 multipart 的分支）。
+   *
+   * 取消路径靠它判断"当前文件是不是已经过了 Complete 这道线"：
+   * 过了线的任务没有 multipart 可取消，绝不能被当成可取消的分片上传。
+   */
+  currentTask: UploadTask | null
+  /**
+   * 本轮已经被显式取消的任务 id。
+   *
+   * 队列是**开跑之前**一次性捕获的（`startUpload` 里的 `queue`），之后用户仍可能
+   * 单独取消其中某个还没开始的任务。那种取消不会 abort 整轮（它只影响那一个任务），
+   * 所以必须在这里记一笔：否则队列循环走到它时，会因为 `canceled` 本身也在
+   * RESUMABLE_STATUSES 里而把"用户刚取消的任务"重新启动。
+   */
+  canceledTaskIds: Set<string>
 }
 
 let activeRun: ActiveRun | null = null
@@ -217,6 +233,22 @@ const throwIfStopped = (run: ActiveRun): void => {
 
   if (run.pauseRequested) throw new UploadPausedError()
 }
+
+/**
+ * 本轮当前文件是否**已经过了 Complete 这条线**（只剩元数据登记）。
+ *
+ * 这是"暂停 / 取消"共同的分界线：
+ *   - 过了线：OSS 对象已经完整存在，没有 multipart 可以 abort，
+ *     也没有分片可以暂停；任何操作都只能"让这一批在这一步之后停下"；
+ *   - 没过线：照旧走各自的破坏性 / 温和路径。
+ *
+ * 同时看 `objectUploaded` 是为了兜住"状态还没来得及切成 metadata_pending"
+ * 的那一瞬：只要对象已经完整，就绝不能再把它当成可取消的分片上传。
+ */
+const isFinalizingMetadata = (run: ActiveRun | null): boolean =>
+  run !== null &&
+  run.currentTask !== null &&
+  (run.currentTask.status === 'metadata_pending' || run.currentTask.objectUploaded)
 
 /**
  * 尽力而为地把"上传活动状态"清掉。
@@ -715,12 +747,19 @@ const progressFromCheckpoint = (
  * 这里只调用 `/api/file/insert/`，不 stat 本地文件、不看当前 UI 目标目录。
  * 使用的路径 / 父目录 / 文件名全部来自任务开始时冻结的目标快照，
  * 因此**原始本地文件被删除或移动也照样能补写成功**。
+ *
+ * ⚠️ **刻意不接收任何 AbortSignal。**
+ *
+ * CompleteMultipartUpload 成功之后，OSS 对象已经完整存在，这个任务不再是
+ * "可以被取消的分片上传"：剩下的只有一次极短的元数据登记。
+ * 如果把它挂在 multipart 的破坏性取消信号上，用户在收尾瞬间点一次"取消上传"
+ * 就会把一次**已经成功的 OSS 完成**变成语义上的"已取消上传"——
+ * 对象在云端存在，`files` 表里却没有记录，用户既看不到也删不掉。
+ *
+ * 因此：insert 请求自己跑完，失败就保持 METADATA_PENDING，
+ * 重试永远只补写元数据、绝不重传对象。要清理这种对象只能靠后端记录本身。
  */
-async function insertMetadataOnly(
-  task: UploadTask,
-  token: string,
-  signal: AbortSignal
-): Promise<void> {
+async function insertMetadataOnly(task: UploadTask, token: string): Promise<void> {
   // 进度停在 99%，标签固定为"正在登记文件信息…"：这一步永远不重传对象。
   task.status = 'metadata_pending'
   task.progress = OSS_PROGRESS_CAP
@@ -731,8 +770,7 @@ async function insertMetadataOnly(
       token,
       stringOfPath: task.targetStringOfPath,
       filename: task.targetFilename || task.name,
-      parentId: task.targetParentId,
-      signal
+      parentId: task.targetParentId
     })
 
     task.progress = 1
@@ -743,15 +781,11 @@ async function insertMetadataOnly(
     // 但下次启动会把这条记录当成待补写再 insert 一次，所以要重试一次。
     await deleteCheckpointSafely(task.id)
   } catch (error) {
-    if (error instanceof UploadCanceledError) {
-      task.status = 'canceled'
-      task.progress = OSS_PROGRESS_CAP
-      task.message = '已取消：OSS 已上传，文件元数据尚未写入'
-      return
-    }
-
-    // OSS 已经成功，只是元数据没写进去：保持 METADATA_PENDING，
-    // 进度停在 99%，重试只补写数据库、绝不重传对象。
+    // 这里**没有**"被取消"这一支：对象已经在 OSS 上完整存在，
+    // 任何失败（含被中断的请求）都只能停在 METADATA_PENDING。
+    //
+    // OSS 已经成功，只是元数据没写进去：保持 99%，
+    // 重试只补写数据库、绝不重传对象。
     task.status = 'metadata_pending'
     task.objectUploaded = true
     task.progress = OSS_PROGRESS_CAP
@@ -824,6 +858,9 @@ async function discardStaleCheckpoint(
     try {
       const credentials = new TransferCredentials({
         identity: checkpoint.target,
+        // abort 也必须落在**原来那个** OSS 对象上：使用 checkpoint 冻结的完整范围。
+        expectedBucket: checkpoint.bucket,
+        expectedRegion: checkpoint.region,
         expectedObjectKey: checkpoint.objectKey,
         getToken: getAccessToken,
         signal: controller.signal
@@ -915,6 +952,9 @@ async function prepareTransfer(
 
     const credentials = new TransferCredentials({
       identity: existing.target,
+      // 续传：完整 OSS 范围来自磁盘上的 checkpoint，此后不可变。
+      expectedBucket: existing.bucket,
+      expectedRegion: existing.region,
       expectedObjectKey: existing.objectKey,
       getToken: getAccessToken,
       signal: run.controller.signal
@@ -957,6 +997,10 @@ async function prepareTransfer(
     }),
     credentials: new TransferCredentials({
       identity: target,
+      // 全新传输：范围还未知，由第一张有效 ticket 冻结
+      //（见 executeTransfer 里把 credentials 的冻结范围抄进 checkpoint）。
+      expectedBucket: '',
+      expectedRegion: '',
       expectedObjectKey: '',
       getToken: getAccessToken,
       signal: run.controller.signal
@@ -982,9 +1026,20 @@ async function executeTransfer(
   //    后续 STS 静默刷新不会重复弹这条提示。
   await credentials.ready()
 
-  if (!checkpoint.objectKey) {
-    checkpoint.objectKey = credentials.objectKey
-  }
+  /**
+   * 冻结完整的 OSS 范围（要求 1）。
+   *
+   * - **全新传输**：credentials 刚刚用第一张 ticket 冻结了 bucket / region / objectKey，
+   *   这里把三者一起抄进 checkpoint；
+   * - **续传**：credentials 是用 checkpoint 里的范围构造的，`ready()` 内部的
+   *   `assertIdentityUnchanged()` 已经断言过两者完全一致——不一致会先抛
+   *   `TransferIdentityChangedError`，根本走不到这三行。
+   *
+   * 也就是说这里只可能写入"同一份范围"，绝不会用新值覆盖旧 checkpoint 的范围。
+   */
+  checkpoint.bucket = credentials.bucket
+  checkpoint.region = credentials.region
+  checkpoint.objectKey = credentials.objectKey
 
   if (checkpoint.partSize <= 0) {
     checkpoint.partSize = PART_SIZE
@@ -1007,7 +1062,7 @@ async function executeTransfer(
     // 空文件没有可拆分的数据，直接 put 一个空 Blob。
     await putEmptyObject(credentials, checkpoint.objectKey, signal)
     task.progress = OSS_PROGRESS_CAP
-    await finishTransfer(task, transfer, run)
+    await finishTransfer(task, transfer)
     return
   }
 
@@ -1072,14 +1127,13 @@ async function executeTransfer(
 
   task.progress = OSS_PROGRESS_CAP
 
-  await finishTransfer(task, transfer, run)
+  await finishTransfer(task, transfer)
 }
 
 /** Complete 已经成功：先落盘 METADATA_PENDING，再写数据库。 */
 async function finishTransfer(
   task: UploadTask,
-  transfer: ActiveTransfer,
-  run: ActiveRun
+  transfer: ActiveTransfer
 ): Promise<void> {
   const { checkpoint } = transfer
 
@@ -1108,7 +1162,9 @@ async function finishTransfer(
     return
   }
 
-  await insertMetadataOnly(task, token, run.controller.signal)
+  // 刻意不传 run.controller.signal：对象已经完整存在，
+  // 破坏性取消不得把这个任务变成"已取消上传"（详见 insertMetadataOnly）。
+  await insertMetadataOnly(task, token)
 }
 
 /** 把 runTask 里抛出来的错误翻译成任务状态。 */
@@ -1236,12 +1292,21 @@ async function runTask(task: UploadTask, run: ActiveRun): Promise<void> {
   //        否则原来那个已经完整上传、没有 DB 记录的 OSS object 会被永久遗留。
   //    所以一律使用任务开始时冻结的目标快照。
   if (task.objectUploaded) {
-    await insertMetadataOnly(task, token, run.controller.signal)
+    // 同样不接破坏性取消信号：这条分支只补写元数据。
+    run.currentTask = task
+
+    try {
+      await insertMetadataOnly(task, token)
+    } finally {
+      if (run.currentTask === task) run.currentTask = null
+    }
+
     return
   }
 
   task.status = 'uploading'
   task.message = ''
+  run.currentTask = task
 
   let transfer: ActiveTransfer | null = null
 
@@ -1293,6 +1358,10 @@ async function runTask(task: UploadTask, run: ActiveRun): Promise<void> {
   } catch (error) {
     await handleTransferError(task, transfer, error)
   } finally {
+    if (run.currentTask === task) {
+      run.currentTask = null
+    }
+
     if (run.transfer === transfer) {
       run.transfer = null
     }
@@ -1487,6 +1556,9 @@ async function destroyTransfer(task: UploadTask): Promise<void> {
     try {
       const credentials = new TransferCredentials({
         identity: checkpoint.target,
+        // 破坏性清理同样只能命中 checkpoint 冻结的那一个 OSS 对象。
+        expectedBucket: checkpoint.bucket,
+        expectedRegion: checkpoint.region,
         expectedObjectKey: checkpoint.objectKey,
         getToken: getAccessToken,
         signal: controller.signal
@@ -1614,7 +1686,9 @@ export async function startUpload(): Promise<void> {
   const run: ActiveRun = {
     controller,
     pauseRequested: false,
-    transfer: null
+    transfer: null,
+    currentTask: null,
+    canceledTaskIds: new Set<string>()
   }
 
   activeRun = run
@@ -1645,6 +1719,11 @@ export async function startUpload(): Promise<void> {
       for (const task of queue) {
         if (controller.signal.aborted) break
         if (run.pauseRequested) break
+
+        // 队列是开跑之前捕获的快照：等待期间用户可能已经取消 / 移除了其中某个任务，
+        // 也可能已经替换成别的批次。此时**绝不能**再启动它。
+        if (run.canceledTaskIds.has(task.id)) continue
+        if (!uploadState.tasks.includes(task)) continue
 
         await runTask(task, run)
 
@@ -1700,9 +1779,18 @@ function requestPauseSync(): ActiveTransfer | null {
 
   const transfer = run.transfer
 
-  // METADATA_PENDING 阶段没有可暂停的东西：OSS 对象已经完整存在，
-  // 剩下的只是一次极短的元数据登记。此时按暂停不应该掐断它。
-  if (transfer && transfer.task.status === 'metadata_pending') return null
+  /**
+   * 当前文件已经过了 Complete 这条线：没有可暂停的东西
+   * （OSS 对象已经完整存在，剩下的只是一次极短的元数据登记）。
+   *
+   * 此时**不打断元数据请求**，但可以把这一批解释成"登记完就停下"：
+   * 置位 pauseRequested 让队列循环在这一步之后退出。
+   * UI 在同样情况下也不会显示"暂停"按钮，这里是服务层的独立保证。
+   */
+  if (isFinalizingMetadata(run)) {
+    run.pauseRequested = true
+    return null
+  }
 
   run.pauseRequested = true
 
@@ -1756,28 +1844,58 @@ export async function pauseUploads(): Promise<void> {
  * 注意语义：第 2 步只是"尽早发出清理请求"，**不保证**在途分片立刻终止
  * （HTTP 请求无法强制中断）。真正的收尾在 multipart 的取消路径里完成
  * （abort -> Promise.allSettled(workers) -> 再次 abort）。
+ *
+ * ---- METADATA_PENDING 边界（要求 2）
+ *
+ * 如果当前文件已经走完 CompleteMultipartUpload（任务处于 `metadata_pending`），
+ * 那么它**已经没有 multipart 可以取消了**，剩下的只是一次元数据登记：
+ *
+ *   - 不 abort 这一轮的 AbortController（那没有意义，也会打断别的东西）；
+ *   - 不调用 AbortMultipartUpload；
+ *   - 不删除它的 checkpoint；
+ *   - 只置位 `run.pauseRequested`，让这一批在**元数据落库之后**停下，
+ *     不再开始下一个文件。
+ *
+ * 其余 pending / paused / error 的任务照旧走破坏性取消。
  */
 export async function cancelUpload(): Promise<void> {
   const run = activeRun
+  const transfer = run?.transfer ?? null
 
-  if (run && !run.controller.signal.aborted) {
-    run.controller.abort()
+  /** 当前文件是否只剩"登记元数据"这一步（详见 isFinalizingMetadata）。 */
+  const finalizingMetadata = isFinalizingMetadata(run)
+
+  if (run) {
+    if (finalizingMetadata) {
+      // 只停止调度：批处理在这一步之后退出，当前元数据请求不受影响。
+      run.pauseRequested = true
+    } else if (!run.controller.signal.aborted) {
+      run.controller.abort()
+    }
   }
 
-  // 不 await：立刻发起、后台完成，绝不阻塞调用方（取消/退出都要保持有界）。
-  void abortActiveMultipartNow()
+  if (!finalizingMetadata) {
+    // 不 await：立刻发起、后台完成，绝不阻塞调用方（取消/退出都要保持有界）。
+    void abortActiveMultipartNow()
+  }
 
   const cleanups: Array<Promise<void>> = []
 
   for (const task of uploadState.tasks) {
     if (isMetadataPendingTask(task)) {
-      // OSS 对象已经完整存在：取消它等于制造一个没有 DB 记录的孤儿对象。
+      // OSS 对象已经完整存在：取消它等于制造一个没有 DB 记录的孤儿对象，
+      // 而且会把一次**已经成功的 OSS 完成**说成"已取消上传"。
       // 这类任务只能"重试补写元数据"，不能取消。
       continue
     }
 
+    if (transfer && task === transfer.task) {
+      // 当前正在跑的那一个：由 runTask 自己的取消/收尾路径负责（含 abort 与删 checkpoint）。
+      continue
+    }
+
     if (task.status === 'uploading' || task.status === 'pausing') {
-      // 正在运行的这一个由 runTask 的取消路径负责收尾（含 abort 与删 checkpoint）。
+      // 理论上不会出现（同一时刻只有一个活动传输），保险起见也交给它自己的收尾路径。
       continue
     }
 
@@ -1785,6 +1903,9 @@ export async function cancelUpload(): Promise<void> {
       task.status = 'canceled'
       task.progress = 0
       task.message = '已取消'
+
+      // 队列是开跑之前捕获的快照：记下来，保证它之后不会被重新启动。
+      run?.canceledTaskIds.add(task.id)
 
       cleanups.push(destroyTransfer(task))
     }
@@ -1818,6 +1939,9 @@ export async function cancelTask(taskId: string): Promise<void> {
   task.status = 'canceled'
   task.progress = 0
   task.message = '已取消'
+
+  // 它可能还在本轮捕获的队列里等着被启动：记下来，绝不能再开始它。
+  activeRun?.canceledTaskIds.add(task.id)
 
   await destroyTransfer(task)
 }

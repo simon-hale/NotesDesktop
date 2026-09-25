@@ -312,12 +312,14 @@ notes:logout         某个窗口退出 / 令牌被判定失效 -> 其它窗口�
 没有 SecurityToken——STS 只活在内存里，重启后重新申请即可。
 
 ```text
-schemaVersion      当前 1；不一致的记录整条丢弃（绝不猜字段含义）
+schemaVersion      当前 2；不一致的记录整条丢弃（绝不猜字段含义）
 transferId         稳定 id，同时就是 UploadTask.id 与 Store 的 key
 ownerUsername      账号名（用于跨账号隔离；不是凭据）
 source             { path, filename, size, modifiedAtMs }   ← 本地源身份
 target             { parentId, stringOfPath, filename }     ← 冻结的传输目标
-objectKey          OSS 对象键（刷新 STS 时必须保持一致）
+bucket             冻结的 OSS bucket      ┐
+region             冻结的 OSS region      ├ 完整的 OSS 范围（schema v2 起持久化）
+objectKey          冻结的 OSS objectKey   ┘
 uploadId           空串表示"还没 init"
 partSize           本次传输使用的分片大小（中途改过配置也能正确续传）
 parts              [{ partNumber, etag, size }]  ← 唯一的权威分片表
@@ -327,6 +329,18 @@ overwrite          后端 same_file_name 的覆盖标记（只用于提示）
 createdAtMs / updatedAtMs
 ```
 
+**为什么必须持久化 bucket + region，而不是只存 objectKey**：同一个 key 在不同
+bucket / region 里是完全不同的对象。只比对 objectKey 无法证明"刷新回来的 STS 凭证
+仍指向原来那个对象"，于是就可能把旧 uploadId 的分片传进另一个存储空间。
+因此续传时三项都从磁盘恢复，并在**每一次** STS 刷新后逐项比对，任何一项不同都
+fail closed（抛 `TransferIdentityChangedError`）：保留旧 checkpoint、保留旧
+uploadId 与本地 PartNumber+ETag、绝不把新值写回 checkpoint、
+也绝不在新范围里静默 init 一个新的 multipart。
+
+schema v1 → v2 是**破坏性**升级：v1 记录没有 bucket / region，无法安全续传，
+因此读取时直接丢弃（本项目尚未发布，不做有风险的半迁移）；
+它们残留的远端分片由 OSS 生命周期规则回收。
+
 写入纪律（`src/services/upload-checkpoints.ts`）：
 
 - **串行落盘**：所有写操作排在同一条 Promise 链上，并且真正 flush 时读的是
@@ -334,10 +348,12 @@ createdAtMs / updatedAtMs
   后完成的分片绝不会覆盖先完成分片刚写下的记录。
 - **每个分片成功后立即落盘**；进程在"OSS 已接受分片"与"本地记下 ETag"之间崩溃也没关系，
   下次 Resume 会重传那一个 partNumber（OSS 允许覆盖）。
-- **损坏即丢弃**：读失败、字段非法、schema 版本不认识、ETag 为空、分片号重复……
+- **损坏即丢弃**：读失败、字段非法、schema 版本不认识、ETag 为空、分片号重复、
+  **OSS 范围（bucket / region / objectKey）有任何一项为空**……
   只要有一样不合法就整条丢掉，界面上给出"部分续传记录已损坏并被丢弃"的提示。
   一份"大部分可用"的 ETag 列表是最危险的东西——它足以让 Complete 通过校验，
-  却合成出一个内容错误的对象。
+  却合成出一个内容错误的对象；一个残缺的 OSS 范围同样危险——它会让"凭证是否
+  仍属于同一个对象"这条校验形同虚设。
 - 丢弃一条记录只会让那个文件重新上传一遍；被遗留的远端分片由 OSS 生命周期规则回收。
 
 #### 认证请求的代际号（防止过期响应覆盖新登录）
@@ -443,6 +459,22 @@ generation === authGeneration && verifiedToken === accessToken
 
 只有三种情况会销毁旧 multipart：**显式取消**、**本地源身份变化**、**明确不可恢复的任务失效**。
 暂停、正常退出、退出登录、换账号都**不会**。
+
+**METADATA_PENDING 是取消的边界。** 当前文件一旦走完 `CompleteMultipartUpload`，
+它就没有 multipart 可以取消了。此时窗口级"取消上传"会退化成
+"这一批到此为止"：
+
+- 不 abort 这一轮的 `AbortController`（那已经打不到任何有意义的东西）；
+- 不调用 `AbortMultipartUpload`、不删除 checkpoint、不打断正在进行的元数据请求；
+- 只置位 `run.pauseRequested`，让队列循环在元数据落库之后退出，不再开始下一个文件。
+
+同一原则也体现在 UI 上：**当前文件只剩登记元数据时，不显示"暂停"按钮**——
+对一个 OSS 传输已经完成的文件展示"暂停"是误导，而且服务层的
+`pauseUploads()` 也会独立忽略这种请求（UI 只是第一道防线）。
+
+队列本身是开跑前捕获的快照，所以循环每轮都会重新检查：
+已经被取消（`run.canceledTaskIds`）或已经不在任务列表里的条目一律跳过，
+绝不会因为 `canceled` 也在"可继续"集合里就被重新启动。
 
 ### ⚠️ 取消是"尽力而为"，不是保证
 
@@ -629,13 +661,19 @@ HKCU\Software\Classes\*\shell\NotesUpload\command
   - 这类任务（`objectUploaded && status !== 'success'`）**只能 Retry**：
     `removeTask` / `clearFinishedTasks` / `clearAllTasks` 都会保留它，
     界面上也不提供"移除"按钮——丢掉它等于制造一个用户看不见也删不掉的 OSS 孤儿对象。
+  - **这条元数据请求不接任何 AbortSignal**：过了 Complete 这条线，任务就不再是
+    "可以被取消的分片上传"。否则用户在收尾瞬间点一次"取消上传"，就会把一次
+    **已经成功的 OSS 完成**变成语义上的"已取消上传"——对象在云端存在、
+    `files` 表里却没有记录。窗口级"取消上传"在这种状态下只会让这一批
+    在元数据落库之后停下，不打断当前请求、不删 checkpoint、不 abort multipart。
 - 同目录同名：后端返回 `same_file_name` 时给出简短覆盖提示并继续上传（沿用后端覆盖语义，
   last-completer-wins）；**STS 静默刷新不会重复弹这条提示**。
 - STS 凭证：`expiration` 解析成绝对 UTC 毫秒 + 60 秒安全余量，
   接近过期就在下一个 OSS 请求之前静默重新申请 `/api/oss/sts/`。
-  刷新只换 client，**不改变 objectKey 与 uploadId**；3 个 worker 共享同一个 in-flight 刷新
-  Promise，并且用"凭证代际号"判断某次 403 是否值得再申请一次 STS——
-  因此并发分片同时撞上凭证过期时只会产生 **1 次**刷新请求。
+  刷新只换 client，**不改变 OSS 范围（bucket / region / objectKey）与 uploadId**；
+  刷新回来的凭证必须与 checkpoint 里冻结的三项**逐项相等**，否则 fail closed；
+  3 个 worker 共享同一个 in-flight 刷新 Promise，并且用"凭证代际号"判断某次 403
+  是否值得再申请一次 STS——因此并发分片同时撞上凭证过期时只会产生 **1 次**刷新请求。
 - **登录态失效（后端 tokenVersion 机制）**在接口层表现为 HTTP **401 / 403**，
   上传流程把它识别为“会话过期”而不是普通上传失败：
 

@@ -4,7 +4,12 @@
  * 一个传输任务（transferId）持有一个实例，它知道这次传输**不可变**的身份：
  *
  *   parentId + stringOfPath + filename  → 申请 STS 时用（目标快照，绝不读当前界面目录）
- *   bucket + region + objectKey         → 第一次申请时冻结，之后每次刷新都必须一致
+ *   bucket + region + objectKey         → 冻结的 OSS 范围，之后每次刷新都必须完全一致
+ *
+ * 为什么必须是三项而不是只有 objectKey：同一个 key 在不同 bucket / region 里是完全
+ * 不同的对象。只比对 objectKey 无法证明"刷新回来的凭证仍指向原来那个对象"，
+ * 于是就可能把旧 uploadId 的分片传进另一个存储空间。
+ * 续传时这三项来自磁盘上的 checkpoint，因此它们能跨进程重启存活。
  *
  * 职责：
  *   1. 在每次需要授权的 OSS 请求之前，确认当前凭证**距离过期还有 60 秒以上**
@@ -36,12 +41,17 @@ export class TransferSessionExpiredError extends Error {
 }
 
 /**
- * 刷新回来的凭证与最初冻结的身份不一致。
+ * 刷新回来的凭证与最初冻结的 OSS 范围不一致。
  *
  * 出现它意味着后端对同一个 (parentId, stringOfPath, filename) 给出了**不同**的
- * objectKey / bucket / region。绝不能拿旧 uploadId 去新对象上继续传：
- * 那会在错误的位置留下一个残缺对象。此时保留 checkpoint（可重试），
- * 但本次传输必须停下。
+ * bucket / region / objectKey。绝不能拿旧 uploadId 去新对象上继续传：
+ * 那会在错误的位置留下一个残缺对象。
+ *
+ * 处理约定（fail closed）：
+ *   - 保留旧 checkpoint（连同旧 uploadId 与本地 PartNumber+ETag）；
+ *   - 绝不用新值覆盖 checkpoint 里的范围；
+ *   - 绝不静默地在新范围里重新 init 一个 multipart；
+ *   - 本次传输停下，让用户显式取消或重新上传。
  */
 export class TransferIdentityChangedError extends Error {
   constructor(detail: string) {
@@ -117,7 +127,15 @@ export interface TransferIdentity {
 
 export interface TransferCredentialsOptions {
   identity: TransferIdentity
-  /** 已知的 objectKey（来自 checkpoint）；空串表示"这次是全新传输，等第一次申请"。 */
+  /**
+   * 期望的 OSS 范围（来自持久化 checkpoint）。
+   *
+   * - **全新传输**：三项都传空串，由第一张有效 ticket 冻结；
+   * - **续传**：三项都必须非空，且此后不可变——每张刷新回来的 ticket 都要
+   *   与之逐项比对，任何不一致都抛 [`TransferIdentityChangedError`]。
+   */
+  expectedBucket: string
+  expectedRegion: string
   expectedObjectKey: string
   /** 每次都重新读取，绝不缓存 JWT。 */
   getToken: () => string
@@ -133,9 +151,10 @@ export class TransferCredentials {
   private ticket: UploadTicket | null = null
   private client: OssClient | null = null
 
+  /** 冻结的 OSS 范围：一旦有值就**只读**，任何 ticket 都不得改写它。 */
+  private frozenBucket: string
+  private frozenRegion: string
   private frozenObjectKey: string
-  private frozenBucket = ''
-  private frozenRegion = ''
 
   /** 同一个任务的刷新去重：3 个 worker 共享同一个 Promise。 */
   private refreshPromise: Promise<void> | null = null
@@ -156,10 +175,22 @@ export class TransferCredentials {
     this.identity = options.identity
     this.getToken = options.getToken
     this.signal = options.signal
+    this.frozenBucket = options.expectedBucket
+    this.frozenRegion = options.expectedRegion
     this.frozenObjectKey = options.expectedObjectKey
   }
 
-  /** 冻结的 objectKey（第一次申请之后就有值）。 */
+  /** 冻结的 bucket（第一张 ticket 之后就有值，之后永不变）。 */
+  get bucket(): string {
+    return this.frozenBucket
+  }
+
+  /** 冻结的 region（第一张 ticket 之后就有值，之后永不变）。 */
+  get region(): string {
+    return this.frozenRegion
+  }
+
+  /** 冻结的 objectKey（第一张 ticket 之后就有值，之后永不变）。 */
   get objectKey(): string {
     return this.frozenObjectKey
   }
@@ -247,29 +278,39 @@ export class TransferCredentials {
   }
 
   /**
-   * 校验刷新回来的凭证仍然指向同一个对象。
+   * 校验刷新回来的凭证仍然指向同一个 OSS 对象。
    *
-   * bucket / region 在第一次申请时冻结；objectKey 在续传时来自 checkpoint，
-   * 因此这里能挡住"后端换了 bucket"或"objectKey 规则变了"这类情况。
+   * 规则：
+   *   - **只补齐"还没冻结"的字段**（全新传输的第一张 ticket），绝不覆盖已有的值；
+   *   - 三项（bucket / region / objectKey）逐一严格比较，任何一项不同都 fail closed。
+   *
+   * 续传时三项都来自磁盘上的 checkpoint，所以这条断言跨进程重启依然有效。
    */
   private assertIdentityUnchanged(ticket: UploadTicket): void {
-    if (!this.frozenObjectKey) {
-      this.frozenObjectKey = ticket.objectKey
-      this.frozenBucket = ticket.bucket
-      this.frozenRegion = ticket.region
-      return
+    // ① 首次冻结：只填空字段。
+    if (!this.frozenBucket) this.frozenBucket = ticket.bucket
+    if (!this.frozenRegion) this.frozenRegion = ticket.region
+    if (!this.frozenObjectKey) this.frozenObjectKey = ticket.objectKey
+
+    // ② 每一次（含第一次）都必须与冻结值完全一致。
+    //    顺序刻意从 bucket 开始：bucket / region 是"更外层"的身份，
+    //    它们的错配比 objectKey 更危险（分片会被传到另一个存储空间）。
+    if (ticket.bucket !== this.frozenBucket) {
+      throw new TransferIdentityChangedError(
+        `bucket 发生变化（期望 ${this.frozenBucket}，实际 ${ticket.bucket || '空'}）`
+      )
+    }
+
+    if (ticket.region !== this.frozenRegion) {
+      throw new TransferIdentityChangedError(
+        `region 发生变化（期望 ${this.frozenRegion}，实际 ${ticket.region || '空'}）`
+      )
     }
 
     if (ticket.objectKey !== this.frozenObjectKey) {
-      throw new TransferIdentityChangedError('objectKey 发生变化')
-    }
-
-    if (this.frozenBucket && ticket.bucket !== this.frozenBucket) {
-      throw new TransferIdentityChangedError('bucket 发生变化')
-    }
-
-    if (this.frozenRegion && ticket.region !== this.frozenRegion) {
-      throw new TransferIdentityChangedError('region 发生变化')
+      throw new TransferIdentityChangedError(
+        `objectKey 发生变化（期望 ${this.frozenObjectKey}，实际 ${ticket.objectKey || '空'}）`
+      )
     }
   }
 
